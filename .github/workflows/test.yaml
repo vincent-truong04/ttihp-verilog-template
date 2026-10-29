@@ -31,10 +31,16 @@ jobs:
           # make will return success even if the tests fail, so check results.xml for failed tests
           python -m cocotb_tools.check_results results.xml
 
+      - name: Run model tests
+        if: success() || failure()
+        run: python -m pytest model/tests -q --junitxml=model/results.xml
+
       - name: Test Summary
         uses: test-summary/action@v2.4
         with:
-          paths: "test/results.xml"
+          paths: |
+            test/results.xml
+            model/results.xml
         if: always()
 
       - name: upload waveform and test results
