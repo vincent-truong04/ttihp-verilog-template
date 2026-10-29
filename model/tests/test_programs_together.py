@@ -25,7 +25,8 @@ def load_all():
 
 def config(layout, name, **kw):
     base, prog = layout[name]
-    return SMConfig(start=base, wrap_target=base + prog.wrap_target, wrap_end=base + prog.wrap, **kw)
+    entry = prog.labels.get("fetch", 0)
+    return SMConfig(start=base + entry, wrap_target=base + prog.wrap_target, wrap_end=base + prog.wrap, **kw)
 
 
 def test_relocate_moves_only_jmp_targets():
@@ -38,7 +39,7 @@ def test_relocate_moves_only_jmp_targets():
 
 def test_all_four_fit():
     emu, layout, used = load_all()
-    assert used == 4 + 9 + 2 + 41 == 56 and used <= IMEM_SIZE
+    assert used == 4 + 9 + 2 + 29 == 44 and used <= IMEM_SIZE
 
 
 def _host(emu, sm, pending, received, shift=0, mask=0xFF):
@@ -78,10 +79,10 @@ def test_spi_and_i2c_masters_at_the_same_time():
                             sideset_base=sck, sideset_count=1, in_base=miso,
                             out_shift_right=False, in_shift_right=False,
                             autopull=True, pull_thresh=8, autopush=True, push_thresh=8))
-    emu.configure(1, config(layout, "i2c_master", out_base=sda, out_count=1, set_base=scl, set_count=1,
-                            sideset_base=sda, sideset_count=1, in_base=sda, jmp_pin=sda,
+    emu.configure(1, config(layout, "i2c_master", out_base=sda, out_count=1, set_base=sda, set_count=1,
+                            sideset_base=scl, sideset_count=1, in_base=sda, jmp_pin=sda,
                             out_shift_right=False, in_shift_right=False, autopush=True, push_thresh=8,
-                            pin_init=(1 << sda) | (1 << scl)))
+                            pin_init=(1 << sda) | (1 << scl), timeout=2000))
     spi_data = list(range(0x30, 0x40))
     spi_pending, spi_rx = [b << 8 for b in spi_data], []
     wr = lambda b: 0x8000 | b << 7 | 1 << 6 | 1 << 5

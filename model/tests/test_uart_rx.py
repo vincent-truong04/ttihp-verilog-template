@@ -31,8 +31,8 @@ def start_uart_rx(clkdiv, sender):
 
 
 def _drain(emu):
-    while (w := emu.pop_rx(0)) is not None:
-        yield w >> 8         # the byte arrives in bits [15:8]
+    while (b := emu.pop_rx_byte(0)) is not None:    # spec v0.3: 1-byte read takes bits [15:8] here
+        yield b
 
 
 def receive(clkdiv, data, baud_error=0.0, start_offset=0.0):

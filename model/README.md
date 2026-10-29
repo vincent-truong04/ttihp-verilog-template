@@ -1,6 +1,6 @@
 # Protocol emulator reference model
 
-A Python reference model for the ISA in [`docs/spec.md`](../docs/spec.md) (v0.2 draft). It has three parts:
+A Python reference model for the ISA in [`docs/spec.md`](../docs/spec.md) (v0.3 draft). It has three parts:
 
 - [`asm.py`](asm.py): an assembler that turns `.pasm` source into 20-bit machine words (spec sections 4–5.1).
 - [`sim.py`](sim.py): a cycle-accurate simulator of the 2-SM emulator (spec section 6). `Emulator.step()` advances one system clock.
@@ -8,8 +8,10 @@ A Python reference model for the ISA in [`docs/spec.md`](../docs/spec.md) (v0.2 
   - `uart_tx.pasm` (4 instructions): 8N1 UART transmitter.
   - `uart_rx.pasm` (9): 8N1 UART receiver with mid-bit sampling and a framing check (IRQ 0).
   - `spi_master.pasm` (2): SPI mode 0 master, 8-bit, full duplex, SCK on side-set.
-  - `i2c_master.pasm` (41): command-driven I2C master with open-drain pins, START/STOP confirmed by
-    qualified-edge WAITs, and a WAIT-timeout budget per transaction. The command format is in the file.
+  - `i2c_master.pasm` (29): command-driven I2C master with open-drain pins, SCL on side-set, START/STOP
+    confirmed by qualified-edge WAITs, and WAIT timeouts. On an error it halts for the host to recover
+    (clear FIFOs, clear the IRQ, jump to `do_stop`). The command format and recovery steps are in the
+    file. Execution starts at its `fetch` label, not at 0.
 - [`devices.py`](devices.py): simulated devices (UART sender, SPI echo slave, I2C target with clock
   stretching and stuck-bus faults, a wire) and `Bench`, which clocks them with the emulator.
 - `asm.relocate(words, base)` moves JMP targets when loading a program at a nonzero address, as the
@@ -45,7 +47,9 @@ for _ in range(5000):
 
 Simulated devices connect through `emu.drive(pin, 0 | 1 | None)` and `emu.line(pin)`. Pads wire-AND, and an
 undriven line reads its pull level: high on `uio` (P0–P7, assuming external pull-ups), low on `ui_in` (P15–P19).
-The host side is `push_tx`, `pop_rx`, `write_irq`, `configure`, `enable`, `enable_mask`, `disable` and `restart`.
+The host side is `push_tx`, `pop_rx`, `push_tx_byte`, `pop_rx_byte`, `write_irq`, `configure`, `enable`,
+`enable_mask`, `disable`, `restart`, `jump` and `clear_fifos`; `sync_bypass[pin]` and `open_drain[pin]` are the
+shared per-pin config bits.
 
 A word with a reserved code or a nonzero unused bit raises `ReservedEncoding` when it executes (spec section 4).
 
@@ -67,9 +71,9 @@ Each was tagged `AMBIGUITY <n>` in the code. The tags now say "resolved" and nam
 | 1 | No assembly syntax | pioasm-style syntax plus the new instructions | 5.1 | PIO §3.3 |
 | 2 | No SET/MOV codes | PIO's codes; CRC at MOV code 4 | 5 SET, MOV | PIO §3.4.8, §3.4.10 |
 | 3 | STATUS undefined | All ones if the TX/RX FIFO level is below N; source only | 5 MOV | PIO §3.4.8 |
-| 4 | WAIT edge reference | Detector runs every system clock while the WAIT is active; edges before it starts don't count | 5 WAIT | Decided |
-| 5 | Timeout off-by-one | Each tick: met → done; Y == 0 → done, TO set; else Y-- | 5 WAIT | Decided |
-| 6 | When TO clears | When each timeout WAIT starts | 5 WAIT | Decided |
+| 4 | WAIT edge reference | Detector runs every system clock; v0.3: it arms when the instruction before the WAIT completes | 5 WAIT | Decided |
+| 5 | Timeout off-by-one | Each tick: met → done; counter == 0 → done, TO set; else counter-- (v0.3: a dedicated counter, not Y) | 5 WAIT | Decided |
+| 6 | When TO clears | When each timeout WAIT starts (v0.3: sticky until a `JMP to/!to` tests it) | 5 WAIT | Decided |
 | 7 | DELAY tick count | 1 + n ticks, plus its delay field | 5 DELAY | Ruling |
 | 8 | No JMP pin config | Absolute-index JMP pin field | 2, 5 JMP | PIO §3.4.2 |
 | 9 | X-- semantics | Always decrements | 5 JMP | PIO §3.4.2 |
@@ -111,7 +115,7 @@ Applying the rules above raised these. All are now accepted and written into the
 9. **Restart also clears TO, reloads the CRC seed, turns taps off and disarms the edge detector** (§6).
 10. **CRC taps apply to every 1-bit shift**, NULL included. The spec tells programs to turn taps off before
     shifting NULL bits that must not enter the CRC (§6).
-11. **A WAIT without timeout leaves TO alone** (§5).
+11. **A WAIT without timeout leaves TO alone** (§5). In v0.3 TO is sticky, and only `JMP to/!to` clears it.
 12. **Edge-detector boundaries:** an edge on the WAIT's first-tick clock doesn't count, and a WAIT can complete
     on the same clock as its edge (§5).
 13. **The divider starts on enable.** A new host **Enable mask** command enables both SMs on the same clock,
@@ -126,3 +130,18 @@ Two notes on the tools and numbers:
   program that turns tapping on anywhere, even when tapping is off at that point.
 - Section 8 shows the 6x4 core holds roughly 40K cells at the hello-world's average cell size. The 24K figure
   in section 1 and the area budget are unchanged.
+
+## v0.3 changes
+
+Spec v0.3 adopts proposals 1–9 from [`docs/program-findings.md`](../docs/program-findings.md). The model
+implements each one:
+- the WAIT edge detector arms when the previous instruction completes
+- a dedicated timeout counter with sticky TO
+- `jmp osr1` / `jmp osr0`
+- host `jump` and `clear_fifos`
+- a 5-bit delay without side-set
+- 1-byte host FIFO access
+- a per-pin synchronizer bypass
+- assembler expressions and `.define`
+
+The I2C master was rewritten around them: 41 → 29 instructions.

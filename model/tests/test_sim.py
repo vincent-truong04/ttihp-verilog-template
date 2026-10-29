@@ -149,39 +149,45 @@ def test_wait_qualifier_checked_at_the_edge_not_later(make):
     assert sm.x == 0
 
 
-def test_wait_timeout_counts_y_and_sets_to(make):
+def test_wait_timeout_uses_the_dedicated_counter_and_sets_to(make):
     src = """
-        set y, 5
+        set y, 9
         wait 1 pin 0 timeout
         jmp to, timed_out
         set x, 1
     timed_out:
         set x, 2
     """
-    emu, sm = make(src, in_base=15)
+    emu, sm = make(src, in_base=15, timeout=5)
     emu.step(1)
     n = ticks_until(emu, lambda: sm.pc != 1)
-    assert n == 6          # spec section 5: Y = n gives up to n + 1 ticks
-    assert sm.to and sm.y == 0
-    emu.step(2)
+    assert n == 6          # spec v0.3 section 5: reload value N gives up to N + 1 ticks
+    assert sm.to and sm.y == 9 and sm.tcount == 0   # Y is not touched
+    emu.step(1)
+    assert not sm.to       # the JMP that tested TO cleared it
+    emu.step(1)
     assert sm.x == 2
 
 
-def test_wait_timeout_with_y_zero_ends_on_first_tick(make):
-    emu, sm = make("wait 1 pin 0 timeout\nnop", in_base=15)
+def test_wait_timeout_zero_ends_on_first_tick(make):
+    emu, sm = make("wait 1 pin 0 timeout\nnop", in_base=15, timeout=0)
     emu.step()
     assert sm.pc == 1 and sm.to
 
 
-def test_wait_success_clears_to_and_keeps_remaining_y(make):
-    src = "set y, 3\nwait 1 pin 0 timeout\nset y, 20\nwait 1 pin 0 timeout\njmp !to, ok\nset x, 1\nok: set x, 2"
-    emu, sm = make(src, in_base=15)
-    ticks_until(emu, lambda: sm.pc == 2)
-    assert sm.to
-    emu.drive(15, 1)
-    ticks_until(emu, lambda: sm.x != 0)
-    assert sm.x == 2 and not sm.to
-    assert 0 < sm.y < 20
+def test_to_is_sticky_across_later_successful_waits(make):
+    src = "wait 1 pin 0 timeout\nwait 1 pin 1 timeout\nwait 1 pin 1 timeout\njmp !to, ok\nset x, 1\nok: set x, 2"
+    emu, sm = make(src, in_base=15, timeout=3)
+    emu.drive(16, 1)
+    ticks_until(emu, lambda: sm.pc == 3)
+    assert sm.to                  # set by the first WAIT; the two that succeeded did not clear it
+    emu.step(2)
+    assert sm.x == 1 and not sm.to
+
+
+def test_timeout_reloads_for_each_wait(make):
+    emu, sm = make("wait 1 pin 0 timeout\nwait 1 pin 0 timeout\nnop", in_base=15, timeout=4)
+    assert ticks_until(emu, lambda: sm.pc == 2) == 10     # 5 + 5 ticks: each WAIT gets the full budget
 
 
 def test_wait_without_timeout_leaves_y_alone(make):
@@ -837,23 +843,57 @@ def _edge_wait(make, clkdiv=1, pol=1, nop_delay=0):
 
 # Timing reminder: a pad change made before step k reaches the SMs' view at step k + 2.
 
-def test_wait_edge_before_wait_starts_does_not_count(make):
-    emu, sm = _edge_wait(make, nop_delay=3)   # nop occupies ticks 1-4, WAIT starts at tick 5
-    emu.enable(0)
-    emu.drive(15, 1)                          # SMs see the rise at step 3, during the nop's delay
-    emu.step(30)
-    assert sm.pc == 1 and sm.x == 0
-
-
-def test_wait_edge_on_first_tick_clock_does_not_count(make):
-    emu, sm = make("nop\nwait 1 edge 0\nset x, 1", enable=False, in_base=15)
+def test_wait_edge_before_the_previous_instruction_completes_does_not_count(make):
+    emu, sm = make("nop [3]\nnop\nwait 1 edge 0\nset x, 1", enable=False, in_base=15)
     emu.drive(15, 0)
     emu.step(3)
+    emu.enable(0)
+    emu.drive(15, 1)          # SMs see the rise at step 3, during the first nop's delay ticks
+    emu.step(30)              # the detector arms when the second nop completes (step 5): too late
+    assert sm.pc == 2 and sm.x == 0
+
+
+def test_wait_edge_during_the_previous_instructions_delay_counts(make):
+    emu, sm = make("nop [3]\nwait 1 edge 0\nset x, 1", enable=False, in_base=15)
+    emu.drive(15, 0)
+    emu.step(3)
+    emu.enable(0)
+    emu.drive(15, 1)          # seen at step 3, after the nop completed at step 1
+    emu.step(8)
+    assert sm.x == 1
+
+
+def test_wait_edge_on_the_arming_clock_does_not_count(make):
+    emu, sm = make("nop\nwait 1 edge 0\nset x, 1", enable=False, in_base=15)
+    emu.drive(15, 0)
+    emu.step(1)
     emu.drive(15, 1)
-    emu.step(1)               # captured now; SMs see it at enabled step 2 = the WAIT's first tick
+    emu.step(2)               # driven before overall step 2, seen at step 4 = enabled step 1: the nop's
+                              # own (arming) clock
     emu.enable(0)
     emu.step(30)
     assert sm.pc == 1 and sm.x == 0
+
+
+def test_wait_edge_as_the_first_instruction_arms_on_its_first_tick(make):
+    emu, sm = make("wait 1 edge 0\nset x, 1", enable=False, in_base=15)
+    emu.drive(15, 0)
+    emu.step(3)
+    emu.enable(0)
+    emu.step(2)
+    emu.drive(15, 1)
+    emu.step(6)
+    assert sm.x == 1
+
+
+@pytest.mark.parametrize("clkdiv", [1, 3, 4, 9])
+def test_wait_catches_an_edge_its_own_previous_instruction_caused(make, clkdiv):
+    # spec v0.3 section 5: the 3-clock pin round trip lands on or before the WAIT's first tick when
+    # clkdiv >= 3; arming when the SET completes still catches it
+    src = "set pindirs, 1\nset pins, 0 [7]\nset pins, 1\nwait 1 edge 0 timeout\njmp to, missed\nset x, 1\nmissed: nop"
+    emu, sm = make(src, set_base=2, set_count=1, in_base=2, clkdiv=clkdiv, timeout=50)
+    emu.run_until(lambda: sm.pc == 6, max_cycles=200 * clkdiv)
+    assert sm.x == 1
 
 
 def test_wait_edge_one_clock_after_first_tick_counts(make):
@@ -898,13 +938,14 @@ def test_wait_qualifier_sampled_on_the_edge_clock(make):
     assert sm.x == 1
 
 
-def test_timeout_wait_clears_to_on_start(make):
-    src = "wait 1 pin 0 timeout\nset y, 50\nwait 1 pin 0 timeout\nnop"
-    emu, sm = make(src, in_base=15)
+def test_to_is_not_cleared_when_a_timeout_wait_starts(make):
+    src = "wait 1 pin 0 timeout\nwait 1 pin 0 timeout\nnop"
+    emu, sm = make(src, in_base=15, timeout=0)
     emu.step()
-    assert sm.to                              # Y = 0: times out on its first tick
-    emu.step(2)
-    assert not sm.to and sm.pc == 2           # cleared when the next timeout WAIT starts
+    assert sm.to
+    emu.drive(15, 1)
+    emu.step(10)
+    assert sm.to                              # v0.3: only a JMP clears it
 
 
 def test_wait_without_timeout_leaves_to(make):
@@ -951,7 +992,6 @@ def test_clkdiv_zero_means_65536(make):
     ((7 << 16) | (1 << 4), "IRQ: unused"),
     ((8 << 16) | (1 << 6), "CRC: unused"),
     ((1 << 16) | (1 << 8) | (3 << 1), "WAIT pin B"),
-    ((0 << 16) | (7 << 6), "reserved JMP condition 7"),
 ])
 def test_reserved_encodings_raise(word, msg):
     emu = Emulator()
@@ -1038,3 +1078,97 @@ def test_output_register_pads_change_one_edge_after_the_write(make):
         levels.append(emu.line(10))
     # set on edges 1, 2, 3, 4 -> pad 1, 0, 1 after edges 2, 3, 4
     assert levels == [0, 1, 0, 1]
+
+
+# ---- v0.3: OSR-bit JMP, long delay, host jump/clear/byte FIFO, synchronizer bypass ----------------
+
+@pytest.mark.parametrize("cond,bits,taken", [("osr1", 0b1, True), ("osr1", 0b0, False), ("osr0", 0b0, True), ("osr0", 0b1, False)])
+def test_jmp_on_osr_bit(make, cond, bits, taken):
+    emu, sm = make(f"pull\njmp {cond}, hit\nnop\nhit: nop", out_shift_right=True)
+    emu.push_tx(0, 0xFFF0 | bits)
+    emu.step(2)
+    assert (sm.pc == 3) == taken
+    assert sm.osr_count == 1 and sm.osr == (0xFFF0 | bits) >> 1
+
+
+def test_jmp_on_osr_bit_shift_left_takes_msb(make):
+    emu, sm = make("pull\njmp osr1, hit\nnop\nhit: nop", out_shift_right=False)
+    emu.push_tx(0, 0x8000)
+    emu.step(2)
+    assert sm.pc == 3
+
+
+def test_jmp_on_osr_bit_uses_autopull_like_out(make):
+    emu, sm = make("loop: jmp osr1, one\njmp loop\none: set x, 1", autopull=True, pull_thresh=4)
+    emu.step(3)
+    assert sm.stalled and sm.pc == 0          # OSR empty, FIFO empty: stalls like OUT
+    emu.push_tx(0, 0b0100)
+    emu.step(1)
+    assert sm.stalled and sm.osr == 0b0100    # refill tick, still stalled (as OUT)
+    ticks_until(emu, lambda: sm.x == 1)
+    assert sm.osr_count == 3
+
+
+def test_jmp_on_osr_bit_is_not_tapped_by_the_crc(make):
+    emu, sm = make("crc tap_out\npull\njmp osr1, a\na: nop", crc_poly=1, crc_width=1)
+    emu.push_tx(0, 1)
+    emu.step(3)
+    assert sm.crc == 0
+
+
+def test_long_delay_without_side_set(make):
+    emu, sm = make("set x, 1 [20]\nset y, 1")
+    emu.step()
+    assert ticks_until(emu, lambda: sm.y == 1) == 21
+
+
+def test_host_jump_cancels_stall_and_delay(make):
+    emu, sm = make("pull\nnop [30]\nset x, 1\nset x, 2")
+    emu.step(3)
+    assert sm.stalled
+    emu.jump(0, 1)
+    emu.step(2)
+    assert sm.delay_count > 0
+    emu.jump(0, 3)
+    emu.step()
+    assert sm.x == 2 and not sm.stalled
+
+
+def test_host_jump_disarms_the_edge_detector(make):
+    emu, sm = make("nop\nwait 1 edge 0\nset x, 1", in_base=15)
+    emu.step(1)
+    assert sm.edge_armed
+    emu.jump(0, 1)
+    assert not sm.edge_armed
+
+
+def test_host_clear_fifos():
+    emu = Emulator()
+    emu.push_tx(0, 1)
+    emu.sms[0].rx_fifo.append(2)
+    emu.clear_fifos(0)
+    assert not emu.sms[0].tx_fifo and not emu.sms[0].rx_fifo
+
+
+@pytest.mark.parametrize("right,word", [(True, 0x00A5), (False, 0xA500)])
+def test_host_tx_byte_is_placed_by_out_direction(make, right, word):
+    emu, sm = make("nop", out_shift_right=right)
+    emu.push_tx_byte(0, 0xA5)
+    assert list(sm.tx_fifo) == [word]
+
+
+@pytest.mark.parametrize("right,word", [(True, 0xA500), (False, 0x00A5)])
+def test_host_rx_byte_is_taken_by_in_direction(make, right, word):
+    emu, sm = make("nop", in_shift_right=right)
+    sm.rx_fifo.append(word)
+    assert emu.pop_rx_byte(0) == 0xA5 and emu.pop_rx_byte(0) is None
+
+
+@pytest.mark.parametrize("bypass,latency", [(0, 2), (1, 0)])
+def test_sync_bypass_removes_input_latency(make, bypass, latency):
+    emu, sm = make("wait 1 pin 0\nset x, 1", in_base=15)
+    emu.sync_bypass[15] = bypass
+    emu.step(5)
+    emu.drive(15, 1)
+    n = ticks_until(emu, lambda: sm.pc == 1)
+    assert n == latency + 1

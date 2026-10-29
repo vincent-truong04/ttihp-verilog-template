@@ -2,14 +2,13 @@
 ;
 ; Config: IN base = JMP pin = RX pin, shift right (LSB first), autopush off.
 ; Baud = f_clk / (8 * clkdiv), as for uart_tx.pasm.
-; Each good byte is pushed to the RX FIFO in bits [15:8]: the host takes the upper byte.
+; Each good byte is pushed to the RX FIFO in bits [15:8]; the host's 1-byte RX read returns it.
 ; A bad stop bit (framing error or break) raises IRQ flag 0 and the byte is dropped.
 
 .wrap_target
 start:
-    wait 0 pin 0           [3]  ; start bit (level: still works if we arrive late)
-    set x, 7               [7]  ; 1 + 3 + 8 = 12 ticks: the middle of data bit 0. PIO uses
-                                ; `set x, 7 [10]`; our delay field stops at 7, so the WAIT carries 3
+    wait 0 pin 0                ; start bit (level: still works if we arrive late)
+    set x, 7               [10] ; 1 + 11 = 12 ticks: the middle of data bit 0 (5-bit delay, no side-set)
 bitloop:
     in pins, 1                  ; sample at mid-bit, LSB first
     jmp x--, bitloop       [6]  ; 8 ticks per bit

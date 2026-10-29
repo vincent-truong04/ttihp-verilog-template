@@ -1,10 +1,10 @@
-# Protocol Emulator ISA Spec — v0.2 draft
+# Protocol Emulator ISA Spec — v0.3 draft
 
 ## 1. Overview
 
 A small programmable I/O engine, in the style of the RP2040 PIO, sized for a 6x4 Tiny Tapeout tile on IHP CMOS5L (about 24K logic cells). Protocols are written as short programs and loaded after fabrication over a host SPI interface.
 
-**Status:** v0.2 draft. v0.2 resolves every ambiguity found while building the Python reference model (`model/`). Items marked **Decide** are open choices with a proposed default. Nothing here is final until the UART, SPI and I2C programs are written against it and fit.
+**Status:** v0.3 draft. v0.2 resolved every ambiguity found while building the Python reference model (`model/`). v0.3 adopts the changes proposed after writing the UART RX, SPI and I2C programs ([`program-findings.md`](program-findings.md), items 1–9) and closes the core sizing decisions (section 9). Items marked **Decide** are still open, with a proposed default.
 
 **Convention:** where this spec is silent and RP2040 PIO defines the behavior, PIO's behavior applies. "PIO §x" refers to a section of the RP2040 datasheet, chapter 3.
 
@@ -25,12 +25,14 @@ A small programmable I/O engine, in the style of the RP2040 PIO, sized for a 6x4
 
 | Area | RP2040 PIO | This design |
 | --- | --- | --- |
-| State machines | 4 per block | 2 (**Decide**) |
-| Register width | 32-bit | 16-bit (**Decide**) |
-| Instruction memory | 32 × 16-bit, shared | 64 × 20-bit, shared (**Decide**) |
-| Delay and side-set | Share 5 bits | Separate fields, plus a long `DELAY` instruction |
+| State machines | 4 per block | 2 |
+| Register width | 32-bit | 16-bit |
+| Instruction memory | 32 × 16-bit, shared | 64 × 20-bit, shared |
+| Delay and side-set | Share 5 bits | Separate fields (delay 0–7, or 0–31 without side-set), plus a long `DELAY` instruction |
 | Open-drain | Emulated via PINDIRS | Native per-pin mode |
-| WAIT | One pin or IRQ, can hang forever | Edge qualified by a second pin, optional timeout |
+| WAIT | One pin or IRQ, can hang forever | Edge qualified by a second pin; optional timeout from a dedicated counter |
+| Flag tests | Need an OUT first | `JMP` can shift one OSR bit and branch on it |
+| Recovery | EXEC an instruction from the CPU | Host can jump an SM and clear its FIFOs |
 | Arithmetic | `X--` only | `X--`, `Y--`, plus hardware CRC/parity |
 | Two SMs writing one pin on the same cycle | Highest-numbered SM wins | Lowest-numbered SM wins |
 | Pin reset level | Configured per GPIO by software | Per-SM pin init value, applied on enable |
@@ -47,7 +49,7 @@ Two independent state machines (SMs) fetch from one shared instruction memory. E
 | --- | --- | --- |
 | OSR | 16 | Output shift register: bits shift out to pins |
 | ISR | 16 | Input shift register: bits shift in from pins |
-| X, Y | 16 each | Scratch and loop counters; Y also counts down a WAIT timeout |
+| X, Y | 16 each | Scratch and loop counters |
 | PC | 6 | Program counter into the 64-slot memory |
 | CRC | 16 | Hardware CRC/parity accumulator |
 | TX FIFO | 4 × 16 | Host to SM |
@@ -55,7 +57,8 @@ Two independent state machines (SMs) fetch from one shared instruction memory. E
 | Clock divider | 16 | Integer divider: one instruction tick every N clocks (no fraction) |
 | Delay counter | 10 | Counts out per-instruction and `DELAY` waits |
 | Shift counters | 5 each | Bits shifted out of the OSR and into the ISR, 0–16, saturating (PIO §3.2.3.3) |
-| TO flag | 1 | Set when a WAIT timed out (section 5) |
+| Timeout counter | 16 | Counts down a timeout WAIT; reloaded from the timeout config at the start of each one (section 5) |
+| TO flag | 1 | Set when a WAIT times out; stays set until a `JMP` tests it (section 5) |
 | CRC tap enables | 2 | Tap OUT bits, tap IN bits (section 5, `CRC`) |
 
 CRCZ ("CRC is zero") is not stored: it is the comparison CRC == 0 over the configured width.
@@ -70,8 +73,9 @@ CRCZ ("CRC is zero") is not stored: it is the comparison CRC == 0 over the confi
 - STATUS select (TX or RX FIFO) and level N for `MOV x, STATUS` (PIO EXECCTRL_STATUS_SEL/STATUS_N, §3.4.8)
 - CRC polynomial, width (1–16) and seed
 - Pin init value (section 3)
+- Timeout reload value (16 bits, section 5)
 
-**Shared between SMs:** instruction memory, 4 IRQ flags for SM-to-SM and SM-to-host signalling, and the open-drain mode bit for each `uio` pin.
+**Shared between SMs:** instruction memory, 4 IRQ flags for SM-to-SM and SM-to-host signalling, the open-drain mode bit for each `uio` pin, and the synchronizer-bypass bit for each protocol input (section 6).
 
 ## 3. Pin map
 
@@ -112,8 +116,8 @@ Every instruction is 20 bits. **Decided: 20 bits.** The extra 4 bits over PIO bu
 | Field | Bits | Meaning |
 | --- | --- | --- |
 | opcode | \[19:16\] | 16 opcodes; 10 used, 6 reserved for later |
-| delay | \[15:13\] | Extra ticks (0–7) after the instruction; use `DELAY` for longer waits |
-| side-set | \[12:10\] | \[12\] enable; \[11:10\] values driven onto up to 2 side-set pins this cycle |
+| delay | \[15:13\] | Extra ticks after the instruction: 0–7, or 0–31 when side-set is off (see below); use `DELAY` for longer waits |
+| side-set | \[12:10\] | \[12\] enable; \[11:10\] values driven onto up to 2 side-set pins this cycle. When \[12\] = 0, \[11:10\] are delay\[4:3\] instead |
 | operand | \[9:0\] | Instruction-specific |
 
 **Opcode map.** Bits shown as `0` are unused and must be 0. The assembler enforces this; hardware behavior with them set is undefined, and the reference model stops with an error. Reserved codes are undefined the same way.
@@ -134,6 +138,8 @@ Every instruction is 20 bits. **Decided: 20 bits.** The extra 4 bits over PIO bu
 
 The 16-as-0 count encoding follows PIO, which encodes a count of 32 as 0 (PIO §3.4.4).
 
+**Long delay.** An instruction without side-set has a 5-bit delay: delay\[2:0\] in \[15:13\] and delay\[4:3\] in \[11:10\], so 0–31 extra ticks, as much as PIO gives a program with no side-set. With side-set on, the delay stays 0–7.
+
 ## 5. Instruction set
 
 **JMP** sets PC to addr if the condition holds. Delay cycles apply whether or not the jump is taken (PIO §3.4.2).
@@ -144,14 +150,16 @@ The 16-as-0 count encoding follows PIO, which encodes a count of 32 as 0 (PIO §
 | 1 | X == 0 | 9 | JMP pin low |
 | 2 | X != 0, then X-- | 10 | OSR not empty |
 | 3 | Y == 0 | 11 | RX FIFO full |
-| 4 | Y != 0, then Y-- | 12 | TO set (last timeout WAIT timed out) |
-| 5 | X != Y | 13 | TO clear |
+| 4 | Y != 0, then Y-- | 12 | TO set (then clears it) |
+| 5 | X != Y | 13 | TO clear (and clears it) |
 | 6 | X == Y | 14 | CRCZ set (CRC is zero) |
-| 7 | reserved | 15 | reserved |
+| 7 | shift 1 OSR bit out; it was 1 | 15 | shift 1 OSR bit out; it was 0 |
 
 - **X--/Y--:** the register always decrements, whether or not the jump is taken; the condition tests the value before the decrement (PIO §3.4.2). A loop that starts with X = n runs n + 1 times and leaves X = 0xFFFF.
 - **JMP pin** is the absolute pin index in the SM's JMP pin config (PIO EXECCTRL_JMP_PIN, §3.4.2).
 - **OSR not empty** means the output shift count is below the pull threshold, whether or not autopull is on (PIO `!OSRE`, §3.4.2).
+- **OSR bit (7 and 15)** shifts one bit out of the OSR exactly as `OUT NULL, 1` does: same direction, same shift count, and the same autopull behavior, including the stall when the OSR is empty (section 6). The jump depends on the bit. The bit is not fed to the CRC. These let a program test a command or flag bit in one instruction instead of `OUT x, 1` then `JMP !x`.
+- **TO (12 and 13)** clears TO after testing it, whether or not the jump is taken.
 
 **WAIT** stalls until a pin condition holds. Pins A and B are indexes added to the SM's IN base, modulo 32 (PIO §3.4.3).
 
@@ -165,8 +173,10 @@ The 16-as-0 count encoding follows PIO, which encodes a count of 32 as 0 (PIO §
 Polarity \[7\] picks high or rising (1) versus low or falling (0).
 
 - **Level mode** samples pin A on each tick, as in PIO.
-- **Edge modes** use an edge detector that runs on every system clock while the WAIT is active, whatever the clock divider. On the WAIT's first tick the detector records pin A's synchronized level. On each later system clock it compares pin A with its level one clock earlier. For modes 10 and 11, pin B is sampled on the same clock as the edge. The first qualifying edge is latched, and the WAIT completes on the first tick at or after it. Edges before the WAIT's first tick do not count, and neither does an edge on the first tick's own clock. A WAIT can complete on the same clock as its edge. Pulses shorter than a tick are still caught.
-- **Timeout.** With timeout \[0\] set, TO is cleared when the WAIT starts. Then, on each tick: if the condition is met, the WAIT completes; otherwise, if Y == 0, it completes and sets TO; otherwise Y decrements and the WAIT stays stalled. So Y = n gives up to n + 1 ticks, and Y = 0 checks the condition once. A WAIT without timeout never changes TO or Y. It can stall forever, as in PIO.
+- **Edge modes** use an edge detector that runs on every system clock, whatever the clock divider. It **arms when the instruction before the WAIT completes** (before that instruction's delay ticks): it records pin A's level as the SM sees it then, and from the next clock on compares pin A with its level one clock earlier. For modes 10 and 11, pin B is sampled on the same clock as the edge. The first qualifying edge is latched, and the WAIT completes on the first tick at or after it. Edges before the arming clock do not count. Pulses shorter than a tick are still caught. If nothing completed just before the WAIT (it is the first instruction after enable, restart or a host jump), the detector arms on the WAIT's first tick instead.
+  - Arming early means a WAIT can catch an edge that the instruction before it caused, at any clock divider. A pin write takes 3 clocks to come back (output register, then the synchronizer), which with a divider of 3 or more lands on or before the WAIT's first tick. Example: `set pins, 1` then `wait 1 edge 0 if_high 1` confirms an I2C STOP.
+- **Timeout.** Each SM has a 16-bit timeout counter. With timeout \[0\] set, the WAIT loads the counter from the SM's timeout reload value N on its first tick. Then, on each tick: if the condition is met, the WAIT completes; otherwise, if the counter is 0, it completes and sets TO; otherwise the counter decrements and the WAIT stays stalled. So N gives up to N + 1 ticks, and N = 0 checks the condition once. X and Y are not touched.
+- **TO is sticky.** Only a timeout sets it, and only `JMP to` / `JMP !to` (or a restart) clears it. A program can run several timeout WAITs and test TO once, for example once per byte. A WAIT without timeout can stall forever, as in PIO.
 
 **IN sources / OUT destinations** (3 bits)
 
@@ -224,7 +234,7 @@ STATUS is all ones if the selected FIFO's level (TX or RX, from the STATUS selec
 
 **DELAY n** takes 1 tick plus n extra ticks, like `nop [n]`, so `DELAY 0` is a 1-tick no-op. Its own delay field adds on top. n plus the delay field must fit the 10-bit delay counter (≤ 1023); the assembler enforces this.
 
-**Decide:** whether to add `INC X` / `INC Y` in a reserved opcode, for protocols that need to count up.
+**Decided: no `INC X` / `INC Y`.** None of the UART, SPI or I2C programs counts up.
 
 ### 5.1 Assembly syntax
 
@@ -235,9 +245,10 @@ The syntax follows pioasm (PIO §3.3), with additions for the new instructions:
 .wrap_target                  ; wrap target = next instruction
 .wrap                         ; wrap end = previous instruction
 label:
-    <instr> [side <v>] [[<delay>]]
+    <instr> [side <v>] [[<delay>]]   ; delay 0-7 with side, 0-31 without
+.define <name> <value>        ; a named constant
 
-jmp [<cond>,] <label|addr>    ; cond: !x x-- !y y-- x!=y x==y pin !pin !osre rxfull to !to crcz
+jmp [<cond>,] <label|addr>    ; cond: !x x-- !y y-- x!=y x==y pin !pin !osre rxfull to !to crcz osr1 osr0
 wait <pol> pin <a> [timeout]
 wait <pol> edge <a> [if_high <b> | if_low <b>] [timeout]
 in <src>, <1-16>              ; src: pins x y null isr osr crc
@@ -254,11 +265,13 @@ nop                           ; = mov y, y
 
 Comments start with `;` or `//`. Numbers can be decimal, `0x` hex or `0b` binary. As in pioasm, `side` goes before the `[delay]`, and every instruction has a side-set enable bit, so `side` is always optional.
 
+Any numeric operand can be a number, a `.define` name, a label, or an expression in parentheses, as in pioasm (PIO §3.3.2, §3.3.3): for example `set x, (BITS - 1)`. Expressions combine those values with `+ - * / % & | ^ << >> ~`; division is integer division. A label's value is its offset from the start of the program; a loader that places the program elsewhere moves only JMP targets, so the host adds the load address to any label value a program uses as data, such as an `OUT PC` target.
+
 ## 6. Execution model
 
 **Timing.** Each SM runs one instruction per tick. A tick is one pulse of that SM's clock divider, every N system clocks. N is 1 to 65536, and 65536 is written as 0 (PIO §3.5.5). The divider counts down from N and pulses when it reaches 1, so the first tick comes N system clocks after the SM is enabled (PIO §3.5.5). At 50 MHz with N = 1, one instruction takes 20 ns.
 
-**Delay.** After an instruction completes, the delay field holds the PC for 0–7 extra ticks. `DELAY n` holds it for longer (section 5). Delay ticks do not start until a stalled instruction completes (PIO §3.2.4).
+**Delay.** After an instruction completes, the delay field holds the PC for 0–7 extra ticks (0–31 without side-set). `DELAY n` holds it for longer (section 5). Delay ticks do not start until a stalled instruction completes (PIO §3.2.4).
 
 **Stalls.** A stalled instruction repeats on the next tick with the PC unchanged, and pins keep their last value (PIO §3.2.4). These instructions stall:
 
@@ -266,7 +279,7 @@ Comments start with `;` or `//`. Numbers can be decimal, `0x` hex or `0b` binary
 - a blocking `PULL` on an empty TX FIFO
 - a blocking `PUSH` on a full RX FIFO
 - `IRQ` wait-high and wait-low until the flag matches
-- an `OUT` with autopull enabled when the OSR has reached its threshold
+- an `OUT`, or a `JMP` on an OSR bit, with autopull enabled when the OSR has reached its threshold
 - an `IN` with autopush enabled whose push would find the RX FIFO full
 
 **Side-set.** If enabled, the side-set value is driven onto the side-set pins on the first tick of the instruction, even if the instruction then stalls (PIO §3.2.4, §3.5.1). This lets `pull side 1` hold a line idle while waiting for data. If side-set and an OUT, SET or MOV to PINS write the same pin on the same tick, side-set wins (PIO §3.5.1).
@@ -281,7 +294,7 @@ Wrapping costs no extra tick.
 
 **Shift counters.** These follow PIO §3.2.3.3. Reset and restart set the input count to 0 and the output count to 16 (OSR empty). A PULL or autopull clears the output count; a PUSH or autopush clears the input count; MOV to OSR or ISR clears that register's count.
 
-**Autopull** follows PIO §3.5.4.2 exactly:
+**Autopull** follows PIO §3.5.4.2 exactly. A `JMP` on an OSR bit counts as an OUT here.
 
 - On an OUT tick, if the output count has reached the threshold, the OSR refills from the TX FIFO if it has data, and the OUT stalls this tick either way. So an OUT that finds the OSR empty takes at least 2 ticks. Otherwise the OUT shifts its bits, and if the count has now reached the threshold and the FIFO has data, the OSR refills on the same tick.
 - An OUT that crosses the threshold still shifts all its bits. Once the threshold is reached, any OSR bits beyond it are already zeros.
@@ -294,6 +307,10 @@ Wrapping costs no extra tick.
 **Open-drain pins.** Each `uio` pin has an open-drain bit in the host config. In open-drain mode, writing 0 drives the pin low and writing 1 releases it (output enable off), so the bus pull-up takes it high. PINDIRS has no effect on a pin in open-drain mode. Reading the pin returns the real line level, so a program can detect another device holding it low, such as I2C clock stretching or a lost arbitration.
 
 **Input synchronizers.** Every protocol input passes through a 2-flop synchronizer before any SM sees it (PIO §3.5.6.3), the same reason the hello-world GO input does. This adds 2 system clocks of input latency, which programs must allow for. A pad change between clock edges k−1 and k is captured at edge k, and an SM can first act on it at edge k + 2.
+
+**Synchronizer bypass.** Each protocol input has a bypass bit in the host config, **off by default**. With it on, the SMs see that pad directly, with no added latency, as with PIO's INPUT_SYNC_BYPASS (PIO §3.5.6.3). **It is safe only for inputs that are synchronous to our own outputs**, such as SPI MISO clocked by our SCK, where the program samples at a known time after its own clock edge. On any other input it risks metastability, which can upset the SM. For full-duplex SPI, bypassing MISO lets SCK run at f/4 (divider 1), against f/8 through the synchronizer, provided the slave's clock-to-out after our SCK edge is under about one system clock (20 ns at 50 MHz).
+
+**Enable order.** `uo_out` resets to 0, and a pin init value reaches the pad one clock after enable. A receiver enabled at the same moment as a transmitter that idles high (a UART TX, say) sees that low as a start bit. Enable the SM that drives a line before anything that listens to it, whether another SM or an external device.
 
 **Output register.** **Decided:** every protocol output level and output enable (P0–P14) is driven straight from a flip-flop, so pins change only on clock edges and never glitch. The flip-flop registers the final value, after SM priority, side-set and open-drain logic. A pin written by an instruction at edge k changes right after edge k + 1. Host changes that affect pins, such as open-drain bits or the pin init value written on enable, also reach the pads one clock later. An SM reading its own output sees the change 4 clocks after writing it, the same as PIO with synchronizers (PIO §3.5.6.1). There is no extra stage on inputs.
 
@@ -313,6 +330,7 @@ if feedback: CRC = CRC XOR poly
 **Enable, restart and reset.**
 
 - **Enable** starts the SM's clock divider and writes its pin init value (section 3). The divider starts on enable, unlike PIO's free-running dividers. To run both SMs in lockstep, enable them with one Enable mask command: SMs that go from disabled to enabled in the same command start their dividers on the same clock, so SMs with the same N tick on the same clocks. This replaces PIO's CLKDIV_RESTART (PIO §3.7, CTRL).
+- **Jump and clear FIFOs** are host commands (section 7). A jump sets an SM's PC, and cancels a stalled instruction, any remaining delay and an armed edge detector; other state is kept. Clearing the FIFOs empties that SM's TX and RX FIFOs. Together they let the host recover an SM that has stopped on an error, which PIO does by executing instructions from the CPU (EXEC).
 - **Restart** clears what PIO's SM_RESTART clears (PIO §3.7, CTRL): the shift counters (input 0, output 16), the ISR contents, the delay counter and any stalled instruction. It then sets PC to the start address. As in PIO, OSR, X and Y are kept. Restart also clears TO, reloads the CRC seed, turns both taps off and disarms the WAIT edge detector. It leaves the FIFOs and pin levels alone.
 - **Reset:** everything is cleared, with shift counts as on restart, PC 0, and pins as in section 3.
 
@@ -331,12 +349,15 @@ An SPI slave, mode 0, MSB first. SCK, CS\_N and MOSI are synchronized into the 5
 | Read status | 2 bytes out | FIFO levels, IRQ flags, TO, CRCZ, SM enabled |
 | Write IRQ | 1 byte | Clear flags (write 1 to clear) or force them set, like PIO's IRQ and IRQ_FORCE registers (PIO §3.7) |
 | Write TX FIFO | SM, 2 bytes | Push a word to an SM |
+| Write TX FIFO byte | SM, 1 byte | Push one byte, placed where the SM shifts it out first: bits \[15:8\] if OUT shifts left, \[7:0\] if it shifts right |
 | Read RX FIFO | SM, 2 bytes out | Pop a word from an SM |
-| Control | SM, 1 byte | Enable, disable, restart (section 6) |
+| Read RX FIFO byte | SM, 1 byte out | Pop a word and return the byte where IN shifted it: bits \[15:8\] if IN shifts right, \[7:0\] if it shifts left |
+| Control | SM, 1 byte | Enable, disable, restart, clear FIFOs (section 6) |
+| Jump | SM, 1 byte | Set the SM's PC (section 6) |
 | Enable mask | 1 byte | Writes both SMs' enable bits at once; SMs it enables start together (section 6) |
 | Debug | SM, 1 byte | Single-step; read PC, X, Y, OSR, ISR (stretch) |
 
-Exact opcodes, register addresses and byte formats are still to be defined. The 20-bit pin init value needs two 16-bit config registers.
+Exact opcodes, register addresses and byte formats are still to be defined. The 20-bit pin init value and the 20 synchronizer-bypass bits each need two 16-bit config registers.
 
 ## 8. Area budget (rough estimate)
 
@@ -363,15 +384,15 @@ At that design's average placed cell size (14.7 µm²), 65% of the core would ho
 | Block | Flip-flops | Est. logic cells | Est. total |
 | --- | --- | --- | --- |
 | Instruction memory, 64 × 20 | 1,280 | \~2,500 (two read ports, one per SM) | \~3,800 |
-| State machine, each | \~400 | \~2,000 | \~2,400 |
-| State machines, both | \~800 | \~4,000 | \~4,800 |
+| State machine, each (v0.3: includes the timeout counter and its reload register, about 32 flip-flops) | \~430 | \~2,050 | \~2,480 |
+| State machines, both | \~860 | \~4,100 | \~4,960 |
 | Host SPI and config registers | \~150 | \~250 | \~400 |
-| Pin block (synchronizers, open-drain) | \~60 | \~60 | \~120 |
-| Subtotal |  |  | \~9,100 |
-| Hold-fix delay cells and buffers (+30%; hello-world measured +38%) |  |  | \~2,700 |
-| Total |  |  | \~11,800 |
+| Pin block (synchronizers, bypass, open-drain) | \~60 | \~80 | \~140 |
+| Subtotal |  |  | \~9,300 |
+| Hold-fix delay cells and buffers (+30%; hello-world measured +38%) |  |  | \~2,800 |
+| Total |  |  | \~12,100 |
 
-About 11,800 of roughly 24,000 cells, around half the budget, leaving room under the 60–70% ceiling. At the measured +38%, the total is about 12,600.
+About 12,100 of roughly 24,000 cells, around half the budget, leaving room under the 60–70% ceiling. At the measured +38%, the total is about 12,800.
 
 The biggest single cost is instruction memory, and most of that is the read logic: two SMs fetching every cycle need two independent read ports. If it is over budget, the levers in order are: SRAM for instruction memory, 32 slots instead of 64, 16-bit instructions, or one SM.
 
@@ -379,20 +400,20 @@ The biggest single cost is instruction memory, and most of that is the read logi
 
 Resolve these by writing UART TX/RX, SPI master and I2C master against this spec on paper, then in the Python model.
 
-- [ ] Number of state machines: 2 (proposed) or 1
-- [ ] Register width: 16-bit (proposed) or 8-bit
-- [ ] Instruction memory: 64 slots (proposed) or 32; flip-flops or SRAM
-- [x] Instruction width: 20 bits (decided)
+- [x] Number of state machines: **2** (decided). Full-duplex UART needs both; SPI and I2C run side by side.
+- [x] Register width: **16-bit** (decided). I2C command words use 11 bits, and a 16-bit timeout covers SMBus's 25–35 ms.
+- [x] Instruction memory: **64 slots** (decided). The I2C master alone is over 32. Flip-flops or SRAM is still open.
+- [x] Instruction width: **20 bits** (decided, and confirmed by the programs: separate side-set and delay fields are used together often).
 - [ ] FIFO depth and width: 4 × 16 (proposed)
 - [x] Host interface: SPI (decided)
-- [ ] `INC X` / `INC Y`: add or leave out
+- [x] `INC X` / `INC Y`: **left out** (decided). No program counts up.
 - [ ] Reset style: synchronous or asynchronous
-- [ ] WAIT timeout counter: reuse Y (proposed) or a dedicated counter
+- [x] WAIT timeout counter: **dedicated per-SM counter** with a reload register (decided)
 - [x] Pin pipeline: one output register stage on protocol outputs and output enables, none on inputs (decided)
 - [ ] Stretch: bit-stuffing helper for USB and CAN
 - [ ] Stretch: debug commands over the host interface
 
-**Next step:** write the I2C master program twice on paper, once in plain PIO and once in this ISA. The difference in length and clarity is the core of the novelty argument.
+**Next step:** start the RTL from the reference model, block by block, checking each against the model's tests.
 
 ## 10. Changes from v0.1
 
@@ -410,3 +431,19 @@ Resolve these by writing UART TX/RX, SPI master and I2C master against this spec
 - **Behavior now following PIO:** JMP X--/Y--, `!OSRE`, non-blocking PUSH/PULL, if full/if empty, autopull (including the 2-tick refill-then-OUT), autopush, wrap order, stalls list, IRQ wait-high clearing the flag, clock divider phase, restart, STATUS.
 - **New sections:** assembly syntax (5.1); host IRQ access (section 7).
 - **Section 8:** real hello-world numbers.
+
+## 11. Changes from v0.2
+
+From [`program-findings.md`](program-findings.md):
+
+1. **WAIT edge detector arms when the previous instruction completes**, so a WAIT catches an edge its own program just caused at any clock divider (section 5, WAIT).
+2. **Dedicated timeout counter** per SM, reloaded from a new timeout config register at the start of each timeout WAIT; Y is no longer used. **TO is sticky** until a `JMP to/!to` tests it. No timeout vector (section 5, WAIT; section 2).
+3. **JMP conditions 7 and 15** shift one OSR bit out and branch on it (section 5, JMP).
+4. **Host Jump and Clear FIFOs** commands (sections 6, 7).
+5. **5-bit delay** when side-set is off: \[11:10\] become delay\[4:3\] (section 4).
+6. **1-byte host FIFO commands** that justify the byte by shift direction (section 7).
+7. **Per-pin synchronizer bypass**, default off, safe only for inputs synchronous to our own outputs (section 6).
+8. **Enable-order note** for lines that idle high (section 6).
+9. **Assembler expressions and `.define`** (section 5.1). Tooling only; no hardware change.
+
+Closed decisions: 2 SMs, 16-bit registers, 64 slots, no INC, 20-bit instructions confirmed, dedicated timeout counter (section 9).

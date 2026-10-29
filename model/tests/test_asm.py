@@ -35,8 +35,9 @@ def test_no_side_means_side_enable_clear():
 # ---- per-instruction encodings -------------------------------------------------------------------
 
 @pytest.mark.parametrize("cond,code", [
-    ("", 0), ("!x,", 1), ("x--,", 2), ("!y,", 3), ("y--,", 4), ("x!=y,", 5), ("x==y,", 6),
+    ("", 0), ("!x,", 1), ("x--,", 2), ("!y,", 3), ("y--,", 4), ("x!=y,", 5), ("x==y,", 6), ("osr1,", 7),
     ("pin,", 8), ("!pin,", 9), ("!osre,", 10), ("rxfull,", 11), ("to,", 12), ("!to,", 13), ("crcz,", 14),
+    ("osr0,", 15),
 ])
 def test_jmp_conditions(cond, code):
     assert one(f"jmp {cond} 37") == encode(0, (code << 6) | 37)
@@ -148,7 +149,15 @@ def test_uart_tx_program_assembles():
     ("out crc, 1", "unknown `out` destination"),
     ("set x, 128", "set value must be 0-127"),
     ("set osr, 1", "unknown set destination"),
-    ("nop [8]", "delay field must be 0-7"),
+    ("nop [32]", "delay field must be 0-31"),
+    ("nop side 0 [8]", "0-7 with side-set"),
+    ("set x, nope", "undefined symbol"),
+    ("set x, (1 +)", "bad expression"),
+    ("set x, (1 + 2", "unbalanced parentheses"),
+    ("set x, (open(1))", "unsupported expression"),
+    (".define a 1\n.define a 2\nnop", "defined twice"),
+    (".define osr1 1\nnop", "bad .define name"),
+    ("a: nop\n.define a 1", "defined twice"),
     (".side_set 1\nnop side 2", "side-set value must be 0-1"),
     (".side_set 0\nnop side 0", ".side_set is 0"),
     ("nop side 4", "side-set value must be 0-3"),
@@ -207,3 +216,38 @@ def test_warns_on_in_when_tapping_in():
 
 def test_no_warnings_without_taps():
     assert assemble("crc reset\nout null, 8\nin x, 16").warnings == []
+
+
+# ---- v0.3: long delay, expressions, .define --------------------------------------------------------
+
+def test_long_delay_uses_side_set_bits_when_side_is_off():
+    w = one("nop [27]")
+    assert fields(w)["side_en"] == 0 and fields(w)["delay"] == 27 & 7 and fields(w)["side"] == 27 >> 3
+    w = one("nop side 1 [7]")
+    assert fields(w)["side_en"] == 1 and fields(w)["delay"] == 7 and fields(w)["side"] == 1
+
+
+def test_delay_instruction_with_long_field():
+    assert one("delay 1000 [23]") == encode(9, 1000, delay=23)
+    with pytest.raises(AsmError, match="exceed the 10-bit delay counter"):
+        assemble("delay 1000 [24]")
+
+
+def test_expressions_defines_and_labels():
+    prog = assemble("""
+        .define BITS 8
+        .define TOP (BITS * 2 - 1)
+    start:
+        set x, (BITS - 1)
+        set y, TOP
+        set x, (end - start)          ; labels are offsets from the program start
+        jmp (start + 3)
+        nop [(BITS / 2)]
+    end:
+        nop
+    """)
+    assert prog.words[0] & 0x7F == 7
+    assert prog.words[1] & 0x7F == 15
+    assert prog.words[2] & 0x7F == 5
+    assert prog.words[3] & 0x3F == 3
+    assert fields(prog.words[4])["delay"] == 4

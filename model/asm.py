@@ -1,4 +1,4 @@
-"""Assembler for the protocol emulator ISA (docs/spec.md v0.2, sections 4-5).
+"""Assembler for the protocol emulator ISA (docs/spec.md v0.3, sections 4-5).
 
 Turns .pasm source into 20-bit machine words:
 
@@ -10,10 +10,11 @@ Syntax (spec section 5.1; AMBIGUITY 1, resolved there):
     .side_set <n>        number of side-set pins (0-2), checks `side` values fit
     .wrap_target         wrap target is the next instruction
     .wrap                wrap end is the previous instruction
+    .define <name> <value>
     label:
-        <instr> [side <v>] [[<delay>]]
+        <instr> [side <v>] [[<delay>]]       delay 0-7 with side, 0-31 without
 
-    jmp [<cond>,] <label|addr>      cond: !x x-- !y y-- x!=y x==y pin !pin !osre rxfull to !to crcz
+    jmp [<cond>,] <label|addr>      cond: !x x-- !y y-- x!=y x==y pin !pin !osre rxfull to !to crcz osr1 osr0
     wait <pol> pin <a> [timeout]                    mode 00, level
     wait <pol> edge <a> [timeout]                   mode 01, edge (pol 1 = rising)
     wait <pol> edge <a> if_high <b> [timeout]       mode 10
@@ -29,13 +30,17 @@ Syntax (spec section 5.1; AMBIGUITY 1, resolved there):
     delay <n>            n: 0-1023 (plus any [d] must stay <= 1023)
     nop                  alias for `mov y, y`
 
-Numbers may be decimal, 0x hex or 0b binary. Unused operand bits are always emitted as 0 (spec section 4).
+Numbers may be decimal, 0x hex or 0b binary. Any numeric operand may also be a .define name, a label (its
+offset from the program start), or an expression in parentheses, as in pioasm: `set x, (BITS - 1)`.
+Unused operand bits are always emitted as 0 (spec section 4).
 
 In v1 the CRC only updates on 1-bit OUT/IN shifts (spec section 6), so a program that turns tapping on gets
 a warning for every multi-bit OUT (with tap_out) or IN (with tap_in). The check is static: it does not know
 whether tapping is actually on when that shift runs.
 """
 
+import ast
+import operator
 import re
 import sys
 from dataclasses import dataclass, field
@@ -45,6 +50,7 @@ OP_JMP, OP_WAIT, OP_IN, OP_OUT, OP_PUSHPULL, OP_MOV, OP_SET, OP_IRQ, OP_CRC, OP_
 JMP_CONDS = {
     "": 0, "!x": 1, "x--": 2, "!y": 3, "y--": 4, "x!=y": 5, "x==y": 6,
     "pin": 8, "!pin": 9, "!osre": 10, "rxfull": 11, "to": 12, "!to": 13, "crcz": 14,
+    "osr1": 7, "osr0": 15,
 }
 IN_SRCS = {"pins": 0, "x": 1, "y": 2, "null": 3, "isr": 4, "osr": 5, "crc": 6}
 OUT_DSTS = {"pins": 0, "x": 1, "y": 2, "null": 3, "pindirs": 4, "pc": 5, "isr": 6}
@@ -58,6 +64,7 @@ WAIT_QUALS = {"if_high": 2, "if_low": 3}
 CRC_FLAGS = {"reset": 9, "tap_out": 8, "tap_in": 7}
 
 MAX_DELAY_COUNTER = 1023  # 10-bit delay counter
+MAX_DELAY_FIELD, MAX_DELAY_FIELD_SIDE = 31, 7  # spec section 4: 5 bits without side-set, 3 with
 IMEM_SIZE = 64
 
 
@@ -83,17 +90,61 @@ class Program:
 
 
 def encode(opcode, operand, delay=0, side=None):
-    word = (opcode << 16) | (delay << 13) | operand
+    """Build a word. Without side-set, delay can be 0-31: bits [4:3] go in [11:10] (spec section 4)."""
+    word = (opcode << 16) | ((delay & 7) << 13) | operand
     if side is not None:
         word |= (1 << 12) | (side << 10)
+    else:
+        word |= (delay >> 3) << 10
     return word
 
 
-def _num(tok, what):
+_BINOPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.floordiv,
+    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod, ast.BitAnd: operator.and_,
+    ast.BitOr: operator.or_, ast.BitXor: operator.xor, ast.LShift: operator.lshift, ast.RShift: operator.rshift,
+}
+_UNOPS = {ast.USub: operator.neg, ast.UAdd: operator.pos, ast.Invert: operator.invert}
+
+
+def _eval(node, symbols, what):
+    if isinstance(node, ast.Constant) and type(node.value) is int:
+        return node.value
+    if isinstance(node, ast.Name):
+        if node.id not in symbols:
+            raise AsmError(f"undefined symbol {node.id!r} in {what}")
+        return symbols[node.id]
+    if isinstance(node, ast.BinOp) and type(node.op) in _BINOPS:
+        try:
+            return _BINOPS[type(node.op)](_eval(node.left, symbols, what), _eval(node.right, symbols, what))
+        except ZeroDivisionError:
+            raise AsmError(f"division by zero in {what}")
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNOPS:
+        return _UNOPS[type(node.op)](_eval(node.operand, symbols, what))
+    raise AsmError(f"unsupported expression in {what}")
+
+
+def _num(tok, what, symbols=None):
+    """A number, a symbol (.define name or label), or an expression in parentheses."""
+    symbols = symbols or {}
     try:
         return int(tok, 0)
     except ValueError:
-        raise AsmError(f"expected a number for {what}, got {tok!r}")
+        pass
+    if tok in symbols:
+        return symbols[tok]
+    if tok.startswith("(") and tok.endswith(")"):
+        try:
+            tree = ast.parse(tok, mode="eval")
+        except SyntaxError:
+            raise AsmError(f"bad expression {tok!r} for {what}")
+        return _eval(tree.body, symbols, what)
+    if re.fullmatch(r"[A-Za-z_]\w*", tok):
+        raise AsmError(f"undefined symbol {tok!r} for {what}")
+    raise AsmError(f"expected a number for {what}, got {tok!r}")
+
+
+_num_sym = _num   # module-level evaluator, for code that shadows `_num` with a symbol-bound helper
 
 
 def _range(value, lo, hi, what):
@@ -123,10 +174,32 @@ def _split_suffixes(text):
 
 
 def _tokens(body):
-    return [t for t in re.split(r"[\s,]+", body.strip().lower()) if t]
+    """Split operands on whitespace and commas, keeping parenthesized expressions whole."""
+    tokens, cur, depth = [], "", 0
+    for ch in body.strip().lower():
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                raise AsmError("unbalanced parentheses")
+        if depth == 0 and (ch.isspace() or ch == ","):
+            if cur:
+                tokens.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if depth:
+        raise AsmError("unbalanced parentheses")
+    if cur:
+        tokens.append(cur)
+    return tokens
 
 
-def _encode_body(mnem, args, labels, lineno):
+def _encode_body(mnem, args, symbols, lineno):
+    def _num(tok, what):
+        return _num_sym(tok, what, symbols)
+
     def need(n_min, n_max=None):
         n_max = n_min if n_max is None else n_max
         if not n_min <= len(args) <= n_max:
@@ -138,12 +211,9 @@ def _encode_body(mnem, args, labels, lineno):
         if cond not in JMP_CONDS:
             raise AsmError(f"unknown jmp condition {cond!r}; valid: {', '.join(c for c in JMP_CONDS if c)}")
         target = args[-1]
-        if target in labels:
-            addr = labels[target]
-        elif re.fullmatch(r"(0x[0-9a-f]+|0b[01]+|\d+)", target):
-            addr = _range(_num(target, "jmp address"), 0, IMEM_SIZE - 1, "jmp address")
-        else:
+        if re.fullmatch(r"[a-z_]\w*", target) and target not in symbols:
             raise AsmError(f"undefined label {target!r}")
+        addr = _range(_num(target, "jmp address"), 0, IMEM_SIZE - 1, "jmp address")
         return encode(OP_JMP, (JMP_CONDS[cond] << 6) | addr)
 
     if mnem == "wait":
@@ -240,7 +310,7 @@ def _encode_body(mnem, args, labels, lineno):
 def assemble(source):
     """Assemble .pasm source text into a Program. Raises AsmError with the line number on failure."""
     # Pass 1: labels, directives, instruction lines
-    labels, instrs = {}, []
+    labels, defines, instrs = {}, {}, []
     wrap_target, wrap, side_set = None, None, None
     for lineno, raw in enumerate(source.splitlines(), 1):
         text = _strip_comment(raw)
@@ -250,8 +320,8 @@ def assemble(source):
                 if not m:
                     break
                 name = m.group(1).lower()
-                if name in labels:
-                    raise AsmError(f"label {name!r} defined twice")
+                if name in labels or name in defines:
+                    raise AsmError(f"label {name!r} defined twice" if name in labels else f"{name!r} is already a .define")
                 if name in JMP_CONDS or name in ("timeout",):
                     raise AsmError(f"{name!r} is reserved and cannot be a label")
                 labels[name] = len(instrs)
@@ -271,6 +341,13 @@ def assemble(source):
                     if not instrs:
                         raise AsmError(".wrap must follow at least one instruction")
                     wrap = len(instrs) - 1
+                elif d == ".define" and len(parts) >= 3:
+                    name = parts[1].lower()
+                    if not re.fullmatch(r"[a-z_]\w*", name) or name in JMP_CONDS:
+                        raise AsmError(f"bad .define name {parts[1]!r}")
+                    if name in defines or name in labels:
+                        raise AsmError(f"{name!r} defined twice")
+                    defines[name] = _num(" ".join(parts[2:]).lower(), ".define value", defines)
                 elif d == ".side_set" and len(parts) == 2:
                     if instrs:
                         raise AsmError(".side_set must come before the first instruction")
@@ -287,6 +364,11 @@ def assemble(source):
     if len(instrs) > IMEM_SIZE:
         raise AsmError(f"program has {len(instrs)} instructions; instruction memory holds {IMEM_SIZE}")
 
+    clash = set(labels) & set(defines)
+    if clash:
+        raise AsmError(f"{sorted(clash)[0]!r} is both a label and a .define")
+    symbols = {**defines, **labels}
+
     # Pass 2: encode
     words = []
     for lineno, raw, text in instrs:
@@ -295,21 +377,25 @@ def assemble(source):
             parts = body.split(None, 1)
             mnem = parts[0].lower()
             args = _tokens(parts[1]) if len(parts) > 1 else []
-            word = _encode_body(mnem, args, labels, lineno)
+            word = _encode_body(mnem, args, symbols, lineno)
 
             d = 0
             if delay is not None:
-                d = _range(_num(delay.strip(), "delay"), 0, 7, "delay field")
+                d = _num(delay.strip().lower(), "delay", symbols)
+                if side is not None and d > MAX_DELAY_FIELD_SIDE:
+                    raise AsmError(f"delay field must be 0-{MAX_DELAY_FIELD_SIDE} with side-set, got {d} "
+                                   f"(0-{MAX_DELAY_FIELD} without side-set)")
+                _range(d, 0, MAX_DELAY_FIELD, "delay field")
                 if (word >> 16) == OP_DELAY and (word & 0x3FF) + d > MAX_DELAY_COUNTER:
                     raise AsmError(f"`delay` ticks plus [{d}] exceed the 10-bit delay counter ({MAX_DELAY_COUNTER})")
             s = None
             if side is not None:
-                s = _num(side, "side-set value")
+                s = _num(side.lower(), "side-set value", symbols)
                 limit = 3 if side_set is None else (1 << side_set) - 1
                 if side_set == 0:
                     raise AsmError("`side` used but .side_set is 0")
                 _range(s, 0, limit, "side-set value")
-            words.append(word | (d << 13) | (0 if s is None else (1 << 12) | (s << 10)))
+            words.append(word | encode(0, 0, d, s))
         except AsmError as e:
             raise AsmError(str(e), lineno, raw) from None
 

@@ -13,7 +13,7 @@ PROGRAM = Path(__file__).resolve().parent.parent / "programs" / "spi_master.pasm
 SCK, MOSI, MISO = 8, 9, 15      # uo_out[0], uo_out[1], ui_in[3]
 
 
-def transfer(data, clkdiv, first=0x00):
+def transfer(data, clkdiv, first=0x00, bypass_miso=False):
     prog = assemble_file(PROGRAM)
     emu = Emulator()
     emu.load(prog.words)
@@ -23,15 +23,16 @@ def transfer(data, clkdiv, first=0x00):
         out_shift_right=False, in_shift_right=False,
         autopull=True, pull_thresh=8, autopush=True, push_thresh=8,
     ))
+    emu.sync_bypass[MISO] = int(bypass_miso)
     slave = SpiEchoSlave(SCK, MOSI, MISO, first=first)
     bench = Bench(emu, slave)
     pending, received = list(data), []
 
     def host():
         while pending and len(emu.sms[0].tx_fifo) < FIFO_DEPTH:
-            emu.push_tx(0, pending.pop(0) << 8)       # TX byte goes in bits [15:8]
-        while (w := emu.pop_rx(0)) is not None:
-            received.append(w & 0xFF)
+            emu.push_tx_byte(0, pending.pop(0))       # spec v0.3: placed in [15:8] for a left shift
+        while (b := emu.pop_rx_byte(0)) is not None:
+            received.append(b)
 
     bench.hooks.append(host)
     bench.step(4)
@@ -75,3 +76,14 @@ def test_clkdiv_1_is_too_fast_for_the_miso_round_trip():
     received, slave, emu = transfer(data, 1, first=0x3C)
     assert slave.received == data
     assert received != [0x3C] + data[:-1]
+
+
+@pytest.mark.parametrize("clkdiv", [1, 2])
+def test_bypassing_the_miso_synchronizer_allows_clkdiv_1(clkdiv):
+    # spec v0.3 section 6: MISO is synchronous to our own SCK, so bypassing its synchronizer is safe,
+    # and removes 2 clocks from the round trip: full duplex at SCK = f/4
+    rng = random.Random(11)
+    data = [rng.randrange(256) for _ in range(20)]
+    received, slave, emu = transfer(data, clkdiv, first=0x3C, bypass_miso=True)
+    assert slave.received == data
+    assert received == [0x3C] + data[:-1]

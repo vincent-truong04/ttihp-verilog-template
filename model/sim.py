@@ -1,9 +1,10 @@
-"""Cycle-accurate reference model of the protocol emulator (docs/spec.md v0.2, section 6).
+"""Cycle-accurate reference model of the protocol emulator (docs/spec.md v0.3, section 6).
 
 `Emulator.step()` advances one system clock (one rising edge). Within an edge:
 
-  1. Each pad's line level is resolved from the chip's registered outputs and any external driver.
-  2. Each enabled SM's WAIT edge detector (if armed) compares this clock's synchronized inputs with the last.
+  1. Each pad's line level is resolved from the chip's registered outputs and any external driver. The SMs'
+     view of each input is its second synchronizer flop, or the pad itself if that pin's bypass bit is set.
+  2. Each enabled SM's WAIT edge detector (if armed) compares this clock's view of the inputs with the last.
   3. Each enabled SM's clock divider counts; on a tick the SM executes against the *pre-edge* state:
      synchronized inputs, IRQ flags, its own registers and FIFOs.
   4. Pin and IRQ writes are applied: SM1's first, then SM0's, so the lower-numbered SM wins a conflict.
@@ -64,6 +65,7 @@ class SMConfig:
     crc_width: int = 16
     crc_seed: int = 0
     pin_init: int = 0           # AMBIGUITY 19 (resolved, spec section 3): written to the SM's pins on enable
+    timeout: int = 0            # timeout reload value N: a timeout WAIT allows up to N + 1 ticks (spec v0.3)
 
     def validate(self):
         if not 0 <= self.clkdiv <= 65535:
@@ -80,6 +82,8 @@ class SMConfig:
             raise ValueError("out_count must be 0-16 and set_count 0-7")
         if not (1 <= self.pull_thresh <= 16 and 1 <= self.push_thresh <= 16):
             raise ValueError("autopull/autopush thresholds must be 1-16")
+        if not 0 <= self.timeout <= 0xFFFF:
+            raise ValueError("timeout must be 0-65535")
         if not 0 <= self.status_n <= 15:
             raise ValueError("status_n must be 0-15")
         if not 1 <= self.crc_width <= 16:
@@ -141,6 +145,7 @@ class StateMachine:
         self.edge_armed = False
         self.edge_prev = 0
         self.edge_seen = False
+        self.tcount = 0           # dedicated timeout counter (spec v0.3 section 5)
         self.pc = self.cfg.start
 
     @property
@@ -152,7 +157,7 @@ class StateMachine:
     def _pin_in(self, index):
         # AMBIGUITY 24 (resolved, spec section 3): indexes wrap mod 32, and P20-P31 read as 0
         index %= PIN_SPACE
-        return self.emu.sync_in[index] if index < NUM_PINS else 0
+        return self.emu.view[index] if index < NUM_PINS else 0
 
     def _read_pins(self, base, count):
         return sum(self._pin_in(base + i) << i for i in range(count))
@@ -237,8 +242,10 @@ class StateMachine:
 
         word = self.emu.imem[self.pc]
         opcode = (word >> 16) & 0xF
-        delay = (word >> 13) & 0x7
         side_en = (word >> 12) & 1
+        delay = (word >> 13) & 0x7
+        if not side_en:
+            delay |= ((word >> 10) & 0x3) << 3     # spec v0.3 section 4: 5-bit delay without side-set
         side_val = (word >> 10) & 0x3
         operand = word & 0x3FF
 
@@ -254,7 +261,8 @@ class StateMachine:
         pin_writes.extend(writes)
         pin_writes.extend(side_writes)
 
-        if opcode != OP_OUT:
+        # A JMP on an OSR bit counts as an OUT for autopull (spec v0.3 section 6)
+        if opcode != OP_OUT and not (opcode == OP_JMP and (operand >> 6) in (7, 15)):
             self._autopull_background()
 
         if not done:
@@ -269,6 +277,15 @@ class StateMachine:
         else:
             self.pc = (self.pc + 1) % IMEM_SIZE
         self.delay_count = delay + extra
+        self._prearm_edge()
+
+    def _prearm_edge(self):
+        """Spec v0.3 section 5: an edge-mode WAIT's detector arms when the instruction before it completes."""
+        word = self.emu.imem[self.pc]
+        if word >> 16 == OP_WAIT and (word >> 8) & 3:
+            self.edge_armed = True
+            self.edge_prev = self._pin_in(self.cfg.in_base + ((word >> 4) & 7))
+            self.edge_seen = False
 
     def _reserved(self, what):
         raise ReservedEncoding(f"SM{self.index} pc {self.pc}: {what}")
@@ -310,12 +327,23 @@ class StateMachine:
                 take = self.osr_count < cfg.pull_thresh
             elif cond == 11:
                 take = len(self.rx_fifo) == FIFO_DEPTH
-            elif cond == 12:
-                take = self.to
-            elif cond == 13:
-                take = not self.to
+            elif cond in (12, 13):
+                # spec v0.3 section 5: TO is sticky until a JMP tests it
+                take = self.to if cond == 12 else not self.to
+                self.to = False
             elif cond == 14:
                 take = self.crcz
+            elif cond in (7, 15):
+                # spec v0.3 section 5: shift one OSR bit out exactly like OUT NULL, 1 (autopull included),
+                # and branch on it. The bit is not fed to the CRC.
+                if cfg.autopull and self.osr_count >= cfg.pull_thresh:
+                    if self.tx_fifo:
+                        self.osr, self.osr_count = self.tx_fifo.popleft(), 0
+                    return False, None, 0
+                _, bits = self._shift_out(1)
+                if cfg.autopull and self.osr_count >= cfg.pull_thresh and self.tx_fifo:
+                    self.osr, self.osr_count = self.tx_fifo.popleft(), 0
+                take = bits[0] == (1 if cond == 7 else 0)
             else:
                 self._reserved(f"reserved JMP condition {cond}")
             return True, (addr if take else None), 0
@@ -325,12 +353,12 @@ class StateMachine:
             if mode < 2:
                 self._check_zero(operand, 0b1110, "WAIT pin B in mode 00/01")
             if first_tick and timeout:
-                # AMBIGUITY 6 (resolved, spec section 5 WAIT): TO is cleared when a timeout WAIT starts
-                self.to = False
+                # spec v0.3 section 5: the dedicated counter reloads at the start of each timeout WAIT
+                self.tcount = cfg.timeout
             if mode == 0:
                 met = self._pin_in(cfg.in_base + ((operand >> 4) & 7)) == pol
-            elif first_tick:
-                # Arm the detector; edges before or on this tick's clock do not count
+            elif not self.edge_armed:
+                # Nothing completed just before this WAIT (enable, restart, host jump): arm on its first tick
                 self.edge_armed = True
                 self.edge_prev = self._pin_in(cfg.in_base + ((operand >> 4) & 7))
                 self.edge_seen = False
@@ -341,12 +369,12 @@ class StateMachine:
                 self.edge_armed = False
                 return True, None, 0
             if timeout:
-                # AMBIGUITY 5 (resolved, spec section 5 WAIT): Y == 0 times out and sets TO, else Y--
-                if self.y == 0:
+                # AMBIGUITY 5 (resolved; spec v0.3 section 5): counter == 0 times out and sets TO (sticky)
+                if self.tcount == 0:
                     self.to = True
                     self.edge_armed = False
                     return True, None, 0
-                self.y -= 1
+                self.tcount -= 1
             return False, None, 0
 
         if op == OP_IN:
@@ -549,7 +577,9 @@ class Emulator:
         self.ext = [None] * NUM_PINS
         self.pull = [1] * len(UIO_PINS) + [0] * (NUM_PINS - len(UIO_PINS))
         self.sync1 = [0] * NUM_PINS
-        self.sync_in = [0] * NUM_PINS   # second synchronizer flop: what the SMs read
+        self.sync_in = [0] * NUM_PINS   # second synchronizer flop
+        self.sync_bypass = [0] * NUM_PINS
+        self.view = list(self.sync_in)  # what the SMs read: sync_in, or the pad where bypassed
         self.sms = [StateMachine(self, i) for i in range(NUM_SMS)]
         self.pad = [self._resolve(p) for p in range(NUM_PINS)]   # output register: 0, 1 or None (released)
         self.cycle = 0
@@ -611,6 +641,30 @@ class Emulator:
         f = self.sms[sm].rx_fifo
         return f.popleft() if f else None
 
+    def push_tx_byte(self, sm, byte):
+        """Host 1-byte TX write (spec v0.3 section 7): placed where the SM shifts it out first."""
+        return self.push_tx(sm, (byte & 0xFF) if self.sms[sm].cfg.out_shift_right else (byte & 0xFF) << 8)
+
+    def pop_rx_byte(self, sm):
+        """Host 1-byte RX read (spec v0.3 section 7): the byte from where IN shifted it."""
+        w = self.pop_rx(sm)
+        if w is None:
+            return None
+        return (w >> 8) & 0xFF if self.sms[sm].cfg.in_shift_right else w & 0xFF
+
+    def jump(self, sm, addr):
+        """Host Jump (spec v0.3 section 6): set PC; cancel a stall, any delay and an armed edge detector."""
+        s = self.sms[sm]
+        s.pc = addr % IMEM_SIZE
+        s.stalled = False
+        s.delay_count = 0
+        s.edge_armed = False
+
+    def clear_fifos(self, sm):
+        """Host Clear FIFOs (spec v0.3 section 6)."""
+        self.sms[sm].tx_fifo.clear()
+        self.sms[sm].rx_fifo.clear()
+
     def write_irq(self, clear=0, force=0):
         """Host IRQ access (spec section 7): write-1-to-clear and force-set masks."""
         for i in range(NUM_IRQS):
@@ -655,6 +709,8 @@ class Emulator:
     def step(self, n=1):
         for _ in range(n):
             lines = [self.line(p) for p in range(NUM_PINS)]
+            # spec v0.3 section 6: a bypassed input is seen straight from the pad
+            self.view = [lines[p] if self.sync_bypass[p] else self.sync_in[p] for p in range(NUM_PINS)]
             # Spec section 6, Output register: pads change one edge after the pin state does
             next_pad = [self._resolve(p) for p in range(NUM_PINS)]
             per_sm = []

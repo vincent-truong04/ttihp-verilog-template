@@ -111,16 +111,20 @@ class SpiEchoSlave:
 class I2CTarget:
     """I2C target on an open-drain bus. Writes go to `written`; reads come from `read_data`.
 
-    Options: `stretch` holds SCL low for that many clocks after every byte's ACK clock, and
-    `stretch_bits` after every data bit too. `stuck_sda` / `stuck_scl` hold a line low forever.
+    Options: `stretch` holds SCL low for that many clocks after every byte's ACK clock,
+    `stretch_bits` after every data bit too, and `stretch_before_ack` just before each written data
+    byte's ACK clock.
+    `nack_writes` makes it refuse (NACK) every data byte written to it.
+    `stuck_sda` / `stuck_scl` hold a line low forever.
     """
 
     def __init__(self, address, sda=0, scl=1, read_data=(), stretch=0, stretch_bits=0,
-                 stuck_sda=False, stuck_scl=False):
+                 stretch_before_ack=0, nack_writes=False, stuck_sda=False, stuck_scl=False):
         self.address = address
         self.sda, self.scl = sda, scl
         self.read_data = list(read_data)
         self.stretch, self.stretch_bits = stretch, stretch_bits
+        self.stretch_before_ack, self.nack_writes = stretch_before_ack, nack_writes
         self.stuck_sda, self.stuck_scl = stuck_sda, stuck_scl
         self.written = []
         self.events = []         # "START", "STOP", "ADDR 0x50 W", "NACK master", ...
@@ -164,6 +168,12 @@ class I2CTarget:
                 self.written.append(self.shift & 0xFF)
                 self.state = "write_ack"
             self.sda_out, self.seen_ack_clock = 0, False
+            if st == "write" and self.nack_writes:
+                self.written.pop()
+                self.events.append("NACK data")
+                self.sda_out = None
+            if st == "write":
+                self.hold = self.stretch_before_ack
         elif st in ("addr_ack", "write_ack") and self.seen_ack_clock:
             self.sda_out = None
             self.hold = self.stretch
