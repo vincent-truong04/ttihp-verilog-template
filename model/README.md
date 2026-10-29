@@ -4,7 +4,16 @@ A Python reference model for the ISA in [`docs/spec.md`](../docs/spec.md) (v0.2 
 
 - [`asm.py`](asm.py): an assembler that turns `.pasm` source into 20-bit machine words (spec sections 4–5.1).
 - [`sim.py`](sim.py): a cycle-accurate simulator of the 2-SM emulator (spec section 6). `Emulator.step()` advances one system clock.
-- [`programs/`](programs/): example programs. `uart_tx.pasm` is an 8N1 UART transmitter.
+- [`programs/`](programs/): protocol programs, each tested against a device model:
+  - `uart_tx.pasm` (4 instructions): 8N1 UART transmitter.
+  - `uart_rx.pasm` (9): 8N1 UART receiver with mid-bit sampling and a framing check (IRQ 0).
+  - `spi_master.pasm` (2): SPI mode 0 master, 8-bit, full duplex, SCK on side-set.
+  - `i2c_master.pasm` (41): command-driven I2C master with open-drain pins, START/STOP confirmed by
+    qualified-edge WAITs, and a WAIT-timeout budget per transaction. The command format is in the file.
+- [`devices.py`](devices.py): simulated devices (UART sender, SPI echo slave, I2C target with clock
+  stretching and stuck-bus faults, a wire) and `Bench`, which clocks them with the emulator.
+- `asm.relocate(words, base)` moves JMP targets when loading a program at a nonzero address, as the
+  Pico SDK's loader does.
 
 ## Running
 

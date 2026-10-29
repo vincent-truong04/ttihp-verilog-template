@@ -335,6 +335,20 @@ def assemble(source):
     )
 
 
+def relocate(words, base):
+    """Return the words with JMP targets moved by `base`, for loading a program at a nonzero address.
+
+    This is what a loader does (the Pico SDK does the same in pio_add_program). Only JMP addresses
+    move: addresses a program computes at run time, such as OUT PC data, are the host's to adjust.
+    """
+    out = []
+    for w in words:
+        if w >> 16 == OP_JMP:
+            w = (w & ~0x3F) | ((w & 0x3F) + base) % IMEM_SIZE
+        out.append(w)
+    return out
+
+
 def assemble_file(path):
     with open(path) as f:
         return assemble(f.read())
