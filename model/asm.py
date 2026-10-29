@@ -1,10 +1,10 @@
-"""Assembler for the protocol emulator ISA (docs/spec.md v0.1, sections 4-5).
+"""Assembler for the protocol emulator ISA (docs/spec.md v0.2, sections 4-5).
 
 Turns .pasm source into 20-bit machine words:
 
     [19:16] opcode  [15:13] delay  [12:10] side-set (enable, 2 values)  [9:0] operand
 
-Syntax (PIO-like). AMBIGUITY 1: the spec defines no assembly syntax; see model/README.md.
+Syntax (spec section 5.1; AMBIGUITY 1, resolved there):
 
     ; comment            // comment also works
     .side_set <n>        number of side-set pins (0-2), checks `side` values fit
@@ -22,14 +22,18 @@ Syntax (PIO-like). AMBIGUITY 1: the spec defines no assembly syntax; see model/R
     out <dst>, <n>       dst: pins x y null pindirs pc isr     n: 1-16
     push [iffull] [block|noblock]
     pull [ifempty] [block|noblock]
-    mov <dst>, [~|!|::]<src>         pins x y isr osr crc status (status is source-only)
+    mov <dst>, [~|!|::]<src>         pins x y isr osr crc, plus null and status as sources
     set <dst>, <v>       dst: pins pindirs x y                 v: 0-127
     irq set|clear|wait_high|wait_low <flag>                    flag: 0-3
-    crc [reset] [tap_out] [tap_in] [to_isr]
+    crc [reset] [tap_out] [tap_in]
     delay <n>            n: 0-1023 (plus any [d] must stay <= 1023)
     nop                  alias for `mov y, y`
 
-Numbers may be decimal, 0x hex or 0b binary.
+Numbers may be decimal, 0x hex or 0b binary. Unused operand bits are always emitted as 0 (spec section 4).
+
+In v1 the CRC only updates on 1-bit OUT/IN shifts (spec section 6), so a program that turns tapping on gets
+a warning for every multi-bit OUT (with tap_out) or IN (with tap_in). The check is static: it does not know
+whether tapping is actually on when that shift runs.
 """
 
 import re
@@ -44,15 +48,14 @@ JMP_CONDS = {
 }
 IN_SRCS = {"pins": 0, "x": 1, "y": 2, "null": 3, "isr": 4, "osr": 5, "crc": 6}
 OUT_DSTS = {"pins": 0, "x": 1, "y": 2, "null": 3, "pindirs": 4, "pc": 5, "isr": 6}
-# AMBIGUITY 2: the spec lists SET destinations but gives no codes; reuse the OUT destination codes.
+# AMBIGUITY 2 (resolved, spec section 5 SET and MOV): PIO's codes, with CRC at 4, which PIO leaves unused.
 SET_DSTS = {"pins": 0, "x": 1, "y": 2, "pindirs": 4}
-# AMBIGUITY 2: the spec lists MOV sources/destinations but gives no codes; number them in the order
-# listed. MOV op code 3 is left reserved.
-MOV_REGS = {"pins": 0, "x": 1, "y": 2, "isr": 3, "osr": 4, "crc": 5, "status": 6}
+MOV_SRCS = {"pins": 0, "x": 1, "y": 2, "null": 3, "crc": 4, "status": 5, "isr": 6, "osr": 7}
+MOV_DSTS = {"pins": 0, "x": 1, "y": 2, "crc": 4, "isr": 6, "osr": 7}
 MOV_OPS = {"": 0, "~": 1, "!": 1, "::": 2}
 IRQ_OPS = {"set": 0, "clear": 1, "wait_high": 2, "wait_low": 3}
 WAIT_QUALS = {"if_high": 2, "if_low": 3}
-CRC_FLAGS = {"reset": 9, "tap_out": 8, "tap_in": 7, "to_isr": 6}
+CRC_FLAGS = {"reset": 9, "tap_out": 8, "tap_in": 7}
 
 MAX_DELAY_COUNTER = 1023  # 10-bit delay counter
 IMEM_SIZE = 64
@@ -75,7 +78,8 @@ class Program:
     wrap_target: int
     wrap: int
     side_set: int
-    lines: list = field(default_factory=list)  # source line number for each word
+    lines: list = field(default_factory=list)     # source line number for each word
+    warnings: list = field(default_factory=list)  # "line N: message" strings
 
 
 def encode(opcode, operand, delay=0, side=None):
@@ -163,8 +167,8 @@ def _encode_body(mnem, args, labels, lineno):
         if args[0] not in table:
             raise AsmError(f"unknown `{mnem}` {'source' if mnem == 'in' else 'destination'} {args[0]!r}; valid: {', '.join(table)}")
         count = _range(_num(args[1], "bit count"), 1, 16, "bit count")
-        # AMBIGUITY 26: count [4:0] holds 1-16 directly, so 0 and 17-31 never encode
-        return encode(OP_IN if mnem == "in" else OP_OUT, (table[args[0]] << 7) | count)
+        # AMBIGUITY 26 (resolved, spec section 4): count [3:0], 16 encoded as 0; [6:4] must be 0
+        return encode(OP_IN if mnem == "in" else OP_OUT, (table[args[0]] << 7) | (count & 0xF))
 
     if mnem in ("push", "pull"):
         cond_word = "iffull" if mnem == "push" else "ifempty"
@@ -189,18 +193,18 @@ def _encode_body(mnem, args, labels, lineno):
         dst, src = args
         m = re.fullmatch(r"(~|!|::)?(.*)", src)
         op, src = m.group(1) or "", m.group(2)
-        if dst not in MOV_REGS:
-            raise AsmError(f"unknown mov destination {dst!r}; valid: {', '.join(r for r in MOV_REGS if r != 'status')}")
         if dst == "status":
-            # AMBIGUITY 3
-            raise AsmError("mov to status is not supported: the spec lists STATUS as a destination but does not say what writing it does")
-        if src not in MOV_REGS:
-            raise AsmError(f"unknown mov source {src!r}; valid: {', '.join(MOV_REGS)}")
-        return encode(OP_MOV, (MOV_REGS[dst] << 7) | (MOV_OPS[op] << 5) | MOV_REGS[src])
+            # AMBIGUITY 3 (resolved, spec section 5 MOV): STATUS is source-only, as in PIO
+            raise AsmError("status is a mov source only")
+        if dst not in MOV_DSTS:
+            raise AsmError(f"unknown mov destination {dst!r}; valid: {', '.join(MOV_DSTS)}")
+        if src not in MOV_SRCS:
+            raise AsmError(f"unknown mov source {src!r}; valid: {', '.join(MOV_SRCS)}")
+        return encode(OP_MOV, (MOV_DSTS[dst] << 7) | (MOV_OPS[op] << 5) | MOV_SRCS[src])
 
     if mnem == "nop":
         need(0)
-        return encode(OP_MOV, (MOV_REGS["y"] << 7) | MOV_REGS["y"])
+        return encode(OP_MOV, (MOV_DSTS["y"] << 7) | MOV_SRCS["y"])
 
     if mnem == "set":
         need(2)
@@ -309,7 +313,19 @@ def assemble(source):
         except AsmError as e:
             raise AsmError(str(e), lineno, raw) from None
 
+    # CRC taps only update on 1-bit shifts in v1 (spec section 6): warn about wider shifts
+    warnings = []
+    ops = [(w >> 16, w & 0x3FF) for w in words]
+    taps_out = any(op == OP_CRC and operand & (1 << CRC_FLAGS["tap_out"]) for op, operand in ops)
+    taps_in = any(op == OP_CRC and operand & (1 << CRC_FLAGS["tap_in"]) for op, operand in ops)
+    for (op, operand), lineno in zip(ops, (ln for ln, _, _ in instrs)):
+        count = (operand & 0xF) or 16
+        if count > 1 and ((op == OP_OUT and taps_out) or (op == OP_IN and taps_in)):
+            name = "out" if op == OP_OUT else "in"
+            warnings.append(f"line {lineno}: `{name}` of {count} bits does not update the CRC (v1 taps only 1-bit shifts)")
+
     return Program(
+        warnings=warnings,
         words=words,
         labels=labels,
         wrap_target=0 if wrap_target is None else wrap_target,
@@ -333,6 +349,8 @@ def main(argv):
     except AsmError as e:
         print(f"{argv[1]}: {e}", file=sys.stderr)
         return 1
+    for w in prog.warnings:
+        print(f"{argv[1]}: warning: {w}", file=sys.stderr)
     for addr, word in enumerate(prog.words):
         marks = ("  <- wrap_target" if addr == prog.wrap_target else "") + ("  <- wrap" if addr == prog.wrap else "")
         print(f"{addr:2d}: {word:05x}{marks}")

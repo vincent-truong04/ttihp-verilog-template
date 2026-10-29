@@ -20,6 +20,7 @@ def start_uart(clkdiv):
     emu.configure(0, SMConfig(
         clkdiv=clkdiv, wrap_target=prog.wrap_target, wrap_end=prog.wrap,
         out_base=TX_PIN, out_count=1, sideset_base=TX_PIN, sideset_count=1, out_shift_right=True,
+        pin_init=1 << TX_PIN,   # idle high from enable (spec section 3, pin init value)
     ))
     emu.enable(0)
     return emu
@@ -64,8 +65,8 @@ def test_uart_tx_random_bytes(clkdiv):
     data = [0x00, 0xFF, 0x55, 0xAA, 0x01, 0x80] + [rng.randrange(256) for _ in range(26 if clkdiv < 54 else 6)]
     emu = start_uart(clkdiv)
     bit_clocks = TICKS_PER_BIT * clkdiv
-    emu.step(2 * clkdiv)  # first tick drives the line high (it resets low, see AMBIGUITY 19)
     trace = send_and_capture(emu, data, idle_after=2 * bit_clocks)
+    assert trace[0] == 1
     assert decode_8n1(trace, bit_clocks) == data
 
 
@@ -73,7 +74,6 @@ def test_uart_tx_exact_bit_timing():
     """Every bit lasts exactly 8 ticks, including back-to-back frames (stop bit is 8 ticks, not more)."""
     clkdiv = 2
     emu = start_uart(clkdiv)
-    emu.step(clkdiv)
     trace = send_and_capture(emu, [0x0F, 0xF0], idle_after=0)
     runs, prev, n = [], trace[0], 0
     for v in trace:
@@ -91,8 +91,10 @@ def test_uart_tx_exact_bit_timing():
 
 
 def test_uart_tx_idles_high_and_busy_waits_on_empty_fifo():
+    assert Emulator().line(TX_PIN) == 0      # uo_out resets to 0 ...
     emu = start_uart(1)
-    emu.step(1)
+    emu.step()
+    assert emu.line(TX_PIN) == 1             # ... and the pin init value sets it high from the first edge
     for _ in range(500):
         emu.step()
         assert emu.line(TX_PIN) == 1

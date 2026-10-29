@@ -6,7 +6,7 @@ With clkdiv = 1 the SM ticks on every step(), so step k executes the k-th instru
 import pytest
 
 from model.asm import assemble
-from model.sim import FIFO_DEPTH, Emulator, SMConfig, crc_step
+from model.sim import FIFO_DEPTH, Emulator, ReservedEncoding, SMConfig, crc_step
 
 
 def ticks_until(emu, cond, limit=1000):
@@ -42,7 +42,7 @@ def test_jmp_x_decrement_loop_runs_n_plus_1_times_and_wraps_x(make):
     emu, sm = make("set x, 3\nloop: jmp x--, loop\nset y, 1")
     # set (1) + jmp taken for x=3,2,1 and not taken at x=0 (4) = 5 ticks, then set y on tick 6
     assert ticks_until(emu, lambda: sm.y == 1) == 6
-    assert sm.x == 0xFFFF  # AMBIGUITY 9: decrements even when not taken
+    assert sm.x == 0xFFFF  # spec section 5 JMP (PIO 3.4.2): decrements even when not taken
 
 
 def test_jmp_y_decrement(make):
@@ -161,7 +161,7 @@ def test_wait_timeout_counts_y_and_sets_to(make):
     emu, sm = make(src, in_base=15)
     emu.step(1)
     n = ticks_until(emu, lambda: sm.pc != 1)
-    assert n == 5          # Y = 5 gives 5 ticks of waiting
+    assert n == 6          # spec section 5: Y = n gives up to n + 1 ticks
     assert sm.to and sm.y == 0
     emu.step(2)
     assert sm.x == 2
@@ -232,7 +232,9 @@ def test_in_shift_right_puts_new_bits_at_top(make):
 def test_out_pins_shift_right_lsb_first(make):
     emu, sm = make("pull\nout pins, 3\nout pins, 3", out_base=8, out_count=3)
     emu.push_tx(0, 0b110_101)
-    emu.step(2)
+    emu.step(2)               # first OUT on edge 2; the pad follows on edge 3 (output register)
+    assert [emu.line(p) for p in (8, 9, 10)] == [0, 0, 0]
+    emu.step()
     assert [emu.line(p) for p in (8, 9, 10)] == [1, 0, 1]
     emu.step()
     assert [emu.line(p) for p in (8, 9, 10)] == [0, 1, 1]
@@ -354,20 +356,33 @@ def test_mov_resets_shift_counts(make):
 
 
 def test_mov_pins_both_ways(make):
-    # written on edge 2, captured on edge 3, in the SMs' view after edge 4, read on edge 5
-    emu, sm = make("set x, 5\nmov pins, x [2]\nmov y, pins", out_base=8, out_count=3, in_base=8)
-    emu.step(2)
+    # written on edge 2, on the pad after edge 3, captured on edge 4, in the SMs' view after edge 5,
+    # read on edge 6: 4 clocks of self-observation (spec section 6)
+    emu, sm = make("set x, 5\nmov pins, x [3]\nmov y, pins", out_base=8, out_count=3, in_base=8)
+    emu.step(3)
     assert [emu.line(p) for p in (8, 9, 10)] == [1, 0, 1]
     emu.step(3)
     assert sm.y & 0x7 == 5
 
 
-def test_mov_crc_and_status(make):
-    emu, sm = make("set x, 0\nmov crc, x\nmov y, status\nset x, 3\nmov crc, x\nmov y, status", crc_width=8)
-    emu.step(3)
-    assert sm.y == 0b10       # CRCZ set, TO clear
-    emu.step(3)
-    assert sm.crc == 3 and sm.y == 0
+def test_mov_crc_both_ways(make):
+    emu, sm = make("mov crc, x\nmov y, crc\nmov osr, crc\nmov isr, ::crc", crc_width=8)
+    sm.x = 0x1FF
+    emu.step(4)
+    assert sm.crc == 0xFF and sm.y == 0xFF and sm.osr == 0xFF and sm.osr_count == 0
+    assert sm.isr == 0xFF00 and sm.isr_count == 0
+
+
+@pytest.mark.parametrize("status_rx,n,tx_words,rx_words,expect", [
+    (False, 2, 1, 0, 0xFFFF), (False, 2, 2, 0, 0), (True, 1, 3, 0, 0xFFFF), (False, 0, 0, 0, 0),
+])
+def test_mov_status_compares_fifo_level(make, status_rx, n, tx_words, rx_words, expect):
+    # spec section 5 MOV, PIO 3.4.8: all ones if the selected FIFO's level is below N
+    emu, sm = make("mov x, status", status_rx=status_rx, status_n=n)
+    for i in range(tx_words):
+        emu.push_tx(0, i)
+    emu.step()
+    assert sm.x == expect
 
 
 # ---- SET -----------------------------------------------------------------------------------------
@@ -416,7 +431,7 @@ def test_irq_between_state_machines():
     assert sm1.x == 1
 
 
-def test_irq_same_edge_conflict_sm1_wins():
+def test_irq_same_edge_conflict_sm0_wins():
     emu = Emulator()
     emu.load(assemble("irq set 0").words, 0)
     emu.load(assemble("irq clear 0").words, 1)
@@ -425,17 +440,21 @@ def test_irq_same_edge_conflict_sm1_wins():
     emu.enable(0)
     emu.enable(1)
     emu.step()
-    assert emu.irq[0] == 0
+    assert emu.irq[0] == 1   # spec section 6: SM0's set beats SM1's clear
 
 
 # ---- CRC -----------------------------------------------------------------------------------------
 
 def _crc_program(bits_per_word):
+    # v1 CRC taps only 1-bit shifts (spec section 6), so shift each bit out separately
     return f"""
         crc reset tap_out
     .wrap_target
         pull
-        out null, {bits_per_word}
+        set x, {bits_per_word - 1}
+    bit:
+        out null, 1
+        jmp x--, bit
     .wrap
     """
 
@@ -444,8 +463,7 @@ def _feed_bytes(emu, sm, data):
     for b in data:
         emu.run_until(lambda: len(sm.tx_fifo) < FIFO_DEPTH)
         emu.push_tx(0, b << 8)
-    emu.run_until(lambda: not sm.tx_fifo and sm.pc == 1 and not sm.stalled, max_cycles=100)
-    emu.step(5)
+    emu.run_until(lambda: not sm.tx_fifo and sm.pc == 1 and sm.stalled, max_cycles=200)
 
 
 @pytest.mark.parametrize("poly,width,check", [(0x07, 8, 0xF4), (0x1021, 16, 0x31C3)])
@@ -464,24 +482,51 @@ def test_crc_parity_width_1(make):
     assert sm.crc == 1
 
 
-def test_crc_reset_to_isr_and_crcz_check(make):
+def test_crc_tap_in_mov_to_isr_and_crcz_check(make):
     src = """
+        pull
         crc reset tap_in
-        set x, 0x31            ; '1'
-        in x, 8
-        crc to_isr             ; copy, stop tapping
+        set y, 7
+    bit:
+        out x, 1               ; next bit of '1', MSB first
+        in x, 1                ; tapped
+        jmp y--, bit
+        mov isr, crc           ; spec section 5: replaces the removed move-to-ISR bit
         push
-        mov x, isr             ; ISR was cleared by push
         crc reset
         jmp crcz, zero
         set y, 1
     zero:
         set y, 2
     """
-    emu, sm = make(src, in_shift_right=False, crc_poly=0x07, crc_width=8, crc_seed=0)
-    emu.step(10)
+    emu, sm = make(src, out_shift_right=False, in_shift_right=False, crc_poly=0x07, crc_width=8)
+    emu.push_tx(0, 0x31 << 8)
+    emu.run_until(lambda: sm.rx_fifo, max_cycles=100)
     assert emu.pop_rx(0) == crc_step_bytes(b"1", 0x07, 8)
+    emu.step(3)
     assert sm.y == 2
+
+
+def test_crc_ignores_multibit_shifts(make):
+    emu, sm = make("crc tap_out tap_in\npull\nout null, 8\nin x, 4\nout null, 1",
+                   crc_poly=0x07, crc_width=8, crc_seed=0)
+    emu.push_tx(0, 0xFFFF)
+    emu.step(4)
+    assert sm.crc == 0
+    emu.step()
+    assert sm.crc == 0x07   # the 1-bit OUT (a 1) updates it
+
+
+def test_crc_taps_persist_until_next_crc(make):
+    emu, sm = make("crc tap_out\npull\nout null, 1\nnop\nout null, 1\ncrc\nout null, 1",
+                   out_shift_right=True, crc_poly=1, crc_width=1)
+    emu.push_tx(0, 0b111)
+    emu.step(3)
+    assert sm.crc == 1
+    emu.step(2)
+    assert sm.crc == 0
+    emu.step(2)
+    assert sm.crc == 0 and not sm.tap_out   # `crc` with no flags turned tapping off
 
 
 def test_crc_seed_and_tap_off_by_default(make):
@@ -544,17 +589,19 @@ def test_clock_divider_scales_delay(make):
 def test_side_set_applies_on_first_tick_of_stalled_instruction(make):
     emu, sm = make(".side_set 1\npull side 1\nnop side 0", sideset_base=8, sideset_count=1)
     emu.step()
-    assert emu.line(8) == 1 and sm.stalled
+    assert sm.stalled and emu.out_val[8] == 1 and emu.line(8) == 0   # pad follows next edge
+    emu.step()
+    assert emu.line(8) == 1
     emu.step(20)
     assert emu.line(8) == 1
     emu.push_tx(0, 0)
-    emu.step(2)
+    emu.step(3)               # pull completes, nop side 0, then the pad follows
     assert emu.line(8) == 0
 
 
 def test_side_set_two_pins(make):
     emu, sm = make("nop side 2\nnop side 1", sideset_base=9, sideset_count=2)
-    emu.step()
+    emu.step(2)
     assert (emu.line(9), emu.line(10)) == (0, 1)
     emu.step()
     assert (emu.line(9), emu.line(10)) == (1, 0)
@@ -562,13 +609,14 @@ def test_side_set_two_pins(make):
 
 def test_side_set_wins_over_out_on_same_pin(make):
     emu, sm = make("set pins, 0 side 1", set_base=8, set_count=1, sideset_base=8, sideset_count=1)
-    emu.step()
+    emu.step(2)
     assert emu.line(8) == 1
 
 
 def test_side_set_holds_through_delay(make):
     emu, sm = make("nop side 1 [5]\nnop side 0", sideset_base=8, sideset_count=1)
-    for _ in range(6):
+    emu.step()
+    for _ in range(6):        # ticks 1-6 hold side 1; the pad shows it on edges 2-7
         emu.step()
         assert emu.line(8) == 1
     emu.step()
@@ -601,13 +649,17 @@ def test_autopull_refills_and_stalls_on_empty(make):
     emu.push_tx(0, 0xBBAA)
     emu.push_tx(0, 0xDDCC)
     seen = []
-    for _ in range(4):
+    for _ in range(5):
         emu.step()
         seen.append(sm.x)
-    assert seen == [0xAA, 0xBB, 0xCC, 0xDD]
+    # tick 1: OSR empty, so refill and stall (PIO 3.5.4.2: cannot refill and OUT on the same tick);
+    # tick 3 empties the OSR and refills it on the same tick, so tick 4 does not stall
+    assert seen == [0, 0xAA, 0xBB, 0xCC, 0xDD]
     emu.step(5)
     assert sm.stalled and sm.x == 0xDD
     emu.push_tx(0, 0x00EE)
+    emu.step()
+    assert sm.x == 0xDD and sm.osr == 0x00EE   # refill tick, still stalled
     emu.step()
     assert sm.x == 0xEE
 
@@ -617,10 +669,37 @@ def test_autopull_threshold(make):
     emu.push_tx(0, 0xFF21)
     emu.push_tx(0, 0x0043)
     seen = []
-    for _ in range(4):
+    for _ in range(5):
         emu.step()
         seen.append(sm.x)
-    assert seen == [1, 2, 3, 4]   # upper byte of the first word never shifts out
+    assert seen == [0, 1, 2, 3, 4]   # upper byte of the first word never shifts out
+
+
+def test_autopull_out_crossing_threshold_shifts_all_bits(make):
+    # spec section 6: count 6 + 5 = 11 >= 8, so all 5 bits shift, then the OSR refills on the same tick
+    emu, sm = make("out x, 3\nout x, 3\nout x, 5\nout y, 3", autopull=True, pull_thresh=8)
+    emu.push_tx(0, 0x00FF)
+    emu.push_tx(0, 0x1234)
+    emu.step(4)
+    assert sm.x == 0b00011 and sm.osr == 0x1234 and sm.osr_count == 0
+    emu.step()
+    assert sm.y == 4
+
+
+def test_autopull_background_refill_on_non_out_ticks(make):
+    emu, sm = make("nop [3]\nnop", autopull=True)
+    emu.step(2)
+    emu.push_tx(0, 0xAB)
+    emu.step()               # a delay tick
+    assert sm.osr == 0xAB and sm.osr_count == 0 and not sm.tx_fifo
+
+
+def test_pull_is_noop_when_autopull_and_osr_full(make):
+    emu, sm = make("nop\npull\nmov x, osr", autopull=True)
+    emu.push_tx(0, 1)
+    emu.push_tx(0, 2)
+    emu.step(3)
+    assert sm.x == 1 and list(sm.tx_fifo) == [2]
 
 
 def test_autopush(make):
@@ -649,7 +728,7 @@ def test_open_drain_releases_and_reads_real_level(make):
     emu.open_drain[3] = 1
     emu.drive(3, 0)                  # device stretches the clock
     emu.enable(0)
-    emu.step()
+    emu.step(2)
     assert emu.chip_drive(3) is None # released, not driven high
     assert emu.line(3) == 0
     emu.step(20)
@@ -664,19 +743,19 @@ def test_open_drain_drives_low_regardless_of_pindir(make):
     emu, sm = make("set pins, 0", set_base=2, set_count=1)
     emu.open_drain[2] = 1
     emu.out_val[2] = 1
-    emu.step()
+    emu.step(2)
     assert emu.chip_drive(2) == 0 and emu.pindir[2] == 0 and emu.line(2) == 0
 
 
 def test_push_pull_uio_needs_pindir(make):
     emu, sm = make("set pins, 0\nset pindirs, 1", set_base=1, set_count=1)
-    emu.step()
+    emu.step(2)
     assert emu.chip_drive(1) is None and emu.line(1) == 1   # input: reads the pull-up
     emu.step()
     assert emu.line(1) == 0
 
 
-def test_sm1_wins_pin_conflict():
+def test_sm0_wins_pin_conflict():
     emu = Emulator()
     emu.load(assemble("set pins, 1").words, 0)
     emu.load(assemble("set pins, 0").words, 1)
@@ -684,13 +763,41 @@ def test_sm1_wins_pin_conflict():
     emu.configure(1, SMConfig(start=1, wrap_target=1, wrap_end=1, set_base=8, set_count=1))
     emu.enable(0)
     emu.enable(1)
+    emu.step(2)
+    assert emu.line(8) == 1   # spec section 6: the lower-numbered SM wins (opposite of PIO)
+
+
+def test_pin_conflict_levels_and_directions_are_separate():
+    emu = Emulator()
+    emu.load(assemble("set pins, 0").words, 0)
+    emu.load(assemble("set pindirs, 1").words, 1)
+    emu.configure(0, SMConfig(wrap_end=0, set_base=2, set_count=1))
+    emu.configure(1, SMConfig(start=1, wrap_target=1, wrap_end=1, set_base=2, set_count=1))
+    emu.enable(0)
+    emu.enable(1)
+    emu.step(2)
+    assert emu.out_val[2] == 0 and emu.pindir[2] == 1 and emu.line(2) == 0
+
+
+def test_reset_state():
+    emu = Emulator()
+    assert [emu.line(p) for p in range(8, 15)] == [0] * 7          # uo_out drives 0
+    assert all(emu.chip_drive(p) is None for p in range(8))        # uio released
+    emu.open_drain = [1] * 8                                       # still released (output values are 1)
     emu.step()
-    assert emu.line(8) == 0
+    assert all(emu.chip_drive(p) is None for p in range(8))
 
 
-def test_output_pins_reset_low():
-    # AMBIGUITY 19: no configured idle level, so a UART TX pin starts low
-    assert Emulator().line(8) == 0
+def test_pin_init_applied_on_enable_to_own_groups(make):
+    emu, sm = make("nop", enable=False, out_base=8, out_count=1, sideset_base=9, sideset_count=1,
+                   set_base=4, set_count=1, pin_init=(1 << 8) | (1 << 9) | (1 << 12))
+    emu.out_val[4] = 0
+    emu.enable(0)
+    assert emu.out_val[8] == 1 and emu.line(8) == 0   # the pad follows on the next edge
+    emu.step()
+    assert emu.line(8) == 1 and emu.line(9) == 1
+    assert emu.out_val[4] == 0      # in the SET group, init bit 0
+    assert emu.line(12) == 0        # not in any of this SM's groups
 
 
 # ---- host interface helpers ----------------------------------------------------------------------
@@ -710,7 +817,224 @@ def test_reserved_opcode_raises():
         emu.step()
 
 
-@pytest.mark.parametrize("field,value", [("clkdiv", 0), ("sideset_count", 3), ("crc_width", 17), ("in_base", 20), ("pull_thresh", 0)])
+@pytest.mark.parametrize("field,value", [
+    ("clkdiv", 65536), ("sideset_count", 3), ("crc_width", 17), ("in_base", 32), ("pull_thresh", 0),
+    ("pin_init", 1 << 20), ("status_n", 16),
+])
 def test_config_validation(field, value):
     with pytest.raises(ValueError):
         Emulator().configure(0, SMConfig(**{field: value}))
+
+
+# ---- v0.2 rules ----------------------------------------------------------------------------------
+
+def _edge_wait(make, clkdiv=1, pol=1, nop_delay=0):
+    emu, sm = make(f"nop [{nop_delay}]\nwait {pol} edge 0\nset x, 1", enable=False, in_base=15, clkdiv=clkdiv)
+    emu.drive(15, 1 - pol)
+    emu.step(3)
+    return emu, sm
+
+
+# Timing reminder: a pad change made before step k reaches the SMs' view at step k + 2.
+
+def test_wait_edge_before_wait_starts_does_not_count(make):
+    emu, sm = _edge_wait(make, nop_delay=3)   # nop occupies ticks 1-4, WAIT starts at tick 5
+    emu.enable(0)
+    emu.drive(15, 1)                          # SMs see the rise at step 3, during the nop's delay
+    emu.step(30)
+    assert sm.pc == 1 and sm.x == 0
+
+
+def test_wait_edge_on_first_tick_clock_does_not_count(make):
+    emu, sm = make("nop\nwait 1 edge 0\nset x, 1", enable=False, in_base=15)
+    emu.drive(15, 0)
+    emu.step(3)
+    emu.drive(15, 1)
+    emu.step(1)               # captured now; SMs see it at enabled step 2 = the WAIT's first tick
+    emu.enable(0)
+    emu.step(30)
+    assert sm.pc == 1 and sm.x == 0
+
+
+def test_wait_edge_one_clock_after_first_tick_counts(make):
+    emu, sm = make("nop\nwait 1 edge 0\nset x, 1", enable=False, in_base=15)
+    emu.drive(15, 0)
+    emu.step(3)
+    emu.enable(0)
+    emu.drive(15, 1)          # SMs see it at step 3, the WAIT's second tick
+    emu.step(2)
+    assert sm.pc == 1
+    emu.step(1)
+    assert sm.pc == 2
+
+
+def test_wait_edge_runs_every_system_clock_with_clkdiv(make):
+    # a 2-clock pulse between two ticks of a clkdiv=8 SM is still caught (spec section 5)
+    emu, sm = _edge_wait(make, clkdiv=8)
+    emu.enable(0)
+    emu.step(16)              # nop ticks at clock 8, the WAIT's first tick at clock 16
+    assert sm.pc == 1
+    emu.step(2)               # clocks 17-18
+    emu.drive(15, 1)          # in the SMs' view at clocks 21-22
+    emu.step(2)
+    emu.drive(15, 0)
+    emu.step(3)               # clocks 21-23: pulse comes and goes between ticks
+    assert sm.pc == 1 and emu.sync_in[15] == 0
+    emu.step(1)               # clock 24: next tick sees the latched edge
+    assert sm.pc == 2
+
+
+def test_wait_qualifier_sampled_on_the_edge_clock(make):
+    emu, sm = make("wait 0 edge 0 if_high 1\nset x, 1", enable=False, in_base=15, clkdiv=10)
+    emu.drive(15, 1)
+    emu.drive(16, 1)
+    emu.step(3)
+    emu.enable(0)
+    emu.step(10)              # WAIT's first tick
+    emu.drive(15, 0)          # edge while B high...
+    emu.step(1)
+    emu.drive(16, 0)          # ...B drops before the next tick, but the edge was already qualified
+    emu.step(30)
+    assert sm.x == 1
+
+
+def test_timeout_wait_clears_to_on_start(make):
+    src = "wait 1 pin 0 timeout\nset y, 50\nwait 1 pin 0 timeout\nnop"
+    emu, sm = make(src, in_base=15)
+    emu.step()
+    assert sm.to                              # Y = 0: times out on its first tick
+    emu.step(2)
+    assert not sm.to and sm.pc == 2           # cleared when the next timeout WAIT starts
+
+
+def test_wait_without_timeout_leaves_to(make):
+    emu, sm = make("wait 1 pin 0 timeout\nwait 1 pin 1\nnop", in_base=15)
+    emu.drive(16, 1)
+    emu.step(1)
+    assert sm.to and sm.pc == 1
+    emu.run_until(lambda: sm.pc == 2, max_cycles=10)
+    assert sm.to
+
+
+def test_irq_wait_high_clears_flag():
+    emu = Emulator()
+    emu.load(assemble("irq wait_high 1\nnop").words)
+    emu.configure(0, SMConfig(wrap_end=1))
+    emu.enable(0)
+    emu.write_irq(force=0b0010)
+    emu.step()
+    assert emu.sms[0].pc == 1 and emu.irq[1] == 0
+
+
+def test_host_irq_write():
+    emu = Emulator()
+    emu.write_irq(force=0b1010)
+    assert emu.irq == [0, 1, 0, 1]
+    emu.write_irq(clear=0b0010)
+    assert emu.irq == [0, 0, 0, 1]
+
+
+def test_clkdiv_zero_means_65536(make):
+    emu, sm = make("set x, 1", clkdiv=0)
+    emu.step(65535)
+    assert sm.x == 0
+    emu.step()
+    assert sm.x == 1
+
+
+@pytest.mark.parametrize("word,msg", [
+    ((2 << 16) | (1 << 7) | (1 << 5) | 4, "IN: unused operand bits"),
+    ((3 << 16) | (7 << 7) | 1, "reserved OUT destination 7"),
+    ((4 << 16) | (1 << 8) | 1, "PUSH/PULL: unused"),
+    ((5 << 16) | (1 << 7) | (1 << 3) | 2, "MOV: unused"),
+    ((5 << 16) | (5 << 7) | 1, "reserved MOV destination 5"),
+    ((7 << 16) | (1 << 4), "IRQ: unused"),
+    ((8 << 16) | (1 << 6), "CRC: unused"),
+    ((1 << 16) | (1 << 8) | (3 << 1), "WAIT pin B"),
+    ((0 << 16) | (7 << 6), "reserved JMP condition 7"),
+])
+def test_reserved_encodings_raise(word, msg):
+    emu = Emulator()
+    emu.load([word])
+    emu.enable(0)
+    with pytest.raises(ReservedEncoding, match=msg):
+        emu.step()
+
+
+def test_missing_pins_read_zero_and_ignore_writes(make):
+    # in_base 18: pins 18, 19, then P20-P31 read 0, then P0.. wrap at 32
+    emu, sm = make("mov x, pins\nset pins, 0b11", enable=False, in_base=18, set_base=19, set_count=2)
+    for p in (18, 19):
+        emu.drive(p, 1)
+    emu.step(3)
+    emu.enable(0)
+    emu.step(2)
+    assert sm.x == 0b11 | (1 << 14) | (1 << 15)   # P18, P19, then P0, P1 (uio, pulled up) at bits 14-15
+    assert emu.out_val[19] == 0                    # P19 is input-only; P20 does not exist
+
+
+def test_restart_keeps_x_y_osr_and_clears_the_rest(make):
+    emu, sm = make("set x, 5\nset y, 6\npull\nin null, 3\nnop [7]", crc_seed=0x12, crc_width=8)
+    emu.push_tx(0, 0xBEEF)
+    emu.step(5)
+    sm.crc, sm.to, sm.tap_out = 0x99, True, True
+    emu.restart(0)
+    assert (sm.x, sm.y, sm.osr) == (5, 6, 0xBEEF)
+    assert (sm.isr, sm.isr_count, sm.osr_count, sm.delay_count, sm.pc) == (0, 0, 16, 0, 0)
+    assert sm.crc == 0x12 and not sm.to and not sm.tap_out   # spec section 6 restart extras
+
+
+# ---- v0.2 final: MOV NULL, enable mask, output register ------------------------------------------
+
+def test_mov_null_source(make):
+    emu, sm = make("set x, 9\nmov x, null\nmov y, ~null")
+    emu.step(3)
+    assert sm.x == 0 and sm.y == 0xFFFF
+
+
+def _lockstep_emu(clkdiv):
+    emu = Emulator()
+    emu.load(assemble("loop: jmp x--, loop").words, 0)
+    emu.load(assemble("loop: jmp x--, loop").words, 1)
+    emu.configure(0, SMConfig(clkdiv=clkdiv, wrap_end=0))
+    emu.configure(1, SMConfig(clkdiv=clkdiv, start=1, wrap_target=1, wrap_end=1))
+    return emu
+
+
+def test_enable_mask_starts_both_sms_on_the_same_clock():
+    emu = _lockstep_emu(clkdiv=3)
+    emu.enable_mask(0b11)
+    for _ in range(30):
+        emu.step()
+        assert emu.sms[0].ticks == emu.sms[1].ticks
+    assert emu.sms[0].ticks == 10
+
+
+def test_enable_mask_leaves_a_running_sm_alone():
+    emu = _lockstep_emu(clkdiv=3)
+    emu.enable(0)
+    emu.step(1)
+    emu.enable_mask(0b11)     # SM0 is already running: its divider keeps its phase
+    emu.step(2)
+    assert (emu.sms[0].ticks, emu.sms[1].ticks) == (1, 0)
+    emu.enable_mask(0b10)     # disables SM0, keeps SM1
+    assert not emu.sms[0].enabled and emu.sms[1].enabled
+
+
+def test_enable_mask_pin_init_overlap_sm0_wins():
+    emu = Emulator()
+    emu.load(assemble("nop").words, 0)
+    emu.configure(0, SMConfig(wrap_end=0, out_base=8, out_count=1, pin_init=1 << 8))
+    emu.configure(1, SMConfig(wrap_end=0, out_base=8, out_count=1, pin_init=0))
+    emu.enable_mask(0b11)
+    assert emu.out_val[8] == 1
+
+
+def test_output_register_pads_change_one_edge_after_the_write(make):
+    emu, sm = make("set pins, 1\nset pins, 0", set_base=10, set_count=1)
+    levels = []
+    for _ in range(4):
+        emu.step()
+        levels.append(emu.line(10))
+    # set on edges 1, 2, 3, 4 -> pad 1, 0, 1 after edges 2, 3, 4
+    assert levels == [0, 1, 0, 1]

@@ -61,7 +61,13 @@ def test_wait_modes(src, operand):
 
 @pytest.mark.parametrize("src,code", [("pins", 0), ("x", 1), ("y", 2), ("null", 3), ("isr", 4), ("osr", 5), ("crc", 6)])
 def test_in_sources(src, code):
-    assert one(f"in {src}, 16") == encode(2, (code << 7) | 16)
+    assert one(f"in {src}, 5") == encode(2, (code << 7) | 5)
+
+
+@pytest.mark.parametrize("count,field", [(1, 1), (15, 15), (16, 0)])
+def test_shift_count_16_encodes_as_0(count, field):
+    assert one(f"in x, {count}") & 0x7F == field
+    assert one(f"out x, {count}") & 0x7F == field
 
 
 @pytest.mark.parametrize("dst,code", [("pins", 0), ("x", 1), ("y", 2), ("null", 3), ("pindirs", 4), ("pc", 5), ("isr", 6)])
@@ -78,9 +84,10 @@ def test_push_pull(src, operand):
 
 
 @pytest.mark.parametrize("src,operand", [
-    ("mov x, y", (1 << 7) | 2), ("mov isr, ~osr", (3 << 7) | (1 << 5) | 4),
-    ("mov pins, !x", (0 << 7) | (1 << 5) | 1), ("mov crc, ::isr", (5 << 7) | (2 << 5) | 3),
-    ("mov y, status", (2 << 7) | 6), ("nop", (2 << 7) | 2),
+    ("mov x, y", (1 << 7) | 2), ("mov isr, ~osr", (6 << 7) | (1 << 5) | 7),
+    ("mov pins, !x", (0 << 7) | (1 << 5) | 1), ("mov crc, ::isr", (4 << 7) | (2 << 5) | 6),
+    ("mov y, status", (2 << 7) | 5), ("mov x, null", (1 << 7) | 3), ("mov osr, crc", (7 << 7) | 4), ("mov isr, crc", (6 << 7) | 4),
+    ("nop", (2 << 7) | 2),
 ])
 def test_mov(src, operand):
     assert one(src) == encode(5, operand)
@@ -98,7 +105,7 @@ def test_irq(op, code):
 
 def test_crc_flags_any_order():
     assert one("crc") == encode(8, 0)
-    assert one("crc to_isr reset tap_in tap_out") == encode(8, 0b1111 << 6)
+    assert one("crc tap_in reset tap_out") == encode(8, 0b111 << 7)
     assert one("crc tap_out") == encode(8, 1 << 8)
 
 
@@ -148,8 +155,12 @@ def test_uart_tx_program_assembles():
     ("jmp nowhere", "undefined label"),
     ("jmp 64", "jmp address must be 0-63"),
     ("jmp x++, 0", "unknown jmp condition"),
-    ("mov status, x", "mov to status is not supported"),
+    ("mov status, x", "status is a mov source only"),
     ("mov x, pc", "unknown mov source"),
+    ("mov x, osr2", "unknown mov source"),
+    ("mov null, x", "unknown mov destination"),
+    ("mov pc, x", "unknown mov destination"),
+    ("crc to_isr", "unknown crc option"),
     ("wait 2 pin 0", "wait polarity must be 0-1"),
     ("wait 1 pin 8", "wait pin A must be 0-7"),
     ("wait 1 level 0", "wait syntax"),
@@ -180,3 +191,19 @@ def test_error_reports_line_number():
         assemble("nop\nnop\nset x, 999\n")
     assert e.value.lineno == 3
     assert "line 3" in str(e.value)
+
+
+# ---- CRC 1-bit warnings (spec section 6) ---------------------------------------------------------
+
+def test_warns_on_multibit_shift_when_tapping():
+    prog = assemble("crc tap_out\nout null, 8\nout null, 1\nin x, 4")
+    assert prog.warnings == ["line 2: `out` of 8 bits does not update the CRC (v1 taps only 1-bit shifts)"]
+
+
+def test_warns_on_in_when_tapping_in():
+    prog = assemble("crc reset tap_in\nin pins, 16\nout x, 16")
+    assert len(prog.warnings) == 1 and "line 2: `in` of 16 bits" in prog.warnings[0]
+
+
+def test_no_warnings_without_taps():
+    assert assemble("crc reset\nout null, 8\nin x, 16").warnings == []
