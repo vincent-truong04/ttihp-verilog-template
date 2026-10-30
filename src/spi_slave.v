@@ -75,22 +75,22 @@ module spi_slave (
   //    After 8 bits: update rx_byte, pulse rx_valid for one cycle.
   //    Reset the bit counter whenever CS is inactive.
   // ------------------------------------------------------------------
-  reg [7:0] rx_shift;
+  reg [6:0] rx_shift;
   reg [2:0] bit_cnt;
 
   always @(posedge clk) begin
     rx_valid <= 1'b0;                 
     if (!rst_n) begin
-      rx_shift <= 8'd0;
+      rx_shift <= 7'd0;
       bit_cnt  <= 3'd0;
       rx_byte  <= 8'd0;
     end else if (!cs_active) begin
       bit_cnt  <= 3'b0;             
     end else if (sck_rise) begin
-      rx_shift <= {rx_shift[6:0], mosi_s};          
+      rx_shift <= {rx_shift[5:0], mosi_s};          
       bit_cnt  <= bit_cnt + 1'b1;          
       if (bit_cnt == 3'b111) begin    
-        rx_byte  <= {rx_shift[6:0], mosi_s};        
+        rx_byte  <= {rx_shift, mosi_s};        
         rx_valid <= 1'b1;
       end
     end
